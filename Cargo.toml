@@ -1,0 +1,31 @@
+[package]
+name = "borneo"
+version = "0.1.0"
+edition = "2024"
+description = "A build tool for Java projects"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.102"
+backoff = { version = "0.4.0", features = ["tokio"] }
+bytes = "1.11.1"
+camino = { version = "1.2.2", features = ["serde1"] }
+clap = { version = "4.6.0", features = ["derive"] }
+dashmap = "6.1.0"
+digest = "0.11.2"
+futures-util = "0.3.32"
+hex = "0.4.3"
+indexmap = { version = "2.13.0", features = ["serde"] }
+indicatif = "0.18.4"
+kdl = "6.5.0"
+md-5 = "0.11.0"
+miette = { version = "7.6.0", features = ["fancy"] }
+quick-xml = { version = "0.39.2", features = ["serde", "serialize"] }
+regex = "1.12.3"
+reqwest = { version = "0.13.2", default-features = false, features = ["gzip", "http2", "brotli", "zstd", "rustls", "hickory-dns"] }
+serde = { version = "1.0.228", features = ["derive"] }
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+thiserror = "2.0.18"
+tokio = { version = "1.50.0", features = ["macros", "rt-multi-thread", "time", "sync", "fs"] }
+walkdir = "2.5.0"
