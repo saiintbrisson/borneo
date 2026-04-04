@@ -46,10 +46,11 @@ async fn run(cli: Cli) -> Result<()> {
             let jar_path = project.build().await?;
 
             let java = java::Java::new()?;
+            let native_dirs = project.native_library_dirs();
             eprintln!();
 
             if let Some(jar_path) = jar_path {
-                java.run_jar(&project.dir, &jar_path, &cmd.args)?;
+                java.run_jar(&project.dir, &jar_path, &native_dirs, &cmd.args)?;
             } else {
                 let entry = cmd
                     .entry
@@ -62,9 +63,14 @@ async fn run(cli: Cli) -> Result<()> {
                     &project.out,
                     project.class_path_iter(),
                     entry,
+                    &native_dirs,
                     &cmd.args,
                 )?;
             }
+        }
+        Commands::Test(cmd) => {
+            let mut project = project::Project::from_build_args(&cmd.build_args)?;
+            project.test(&cmd).await?;
         }
         Commands::Clean(cmd) => {
             project::Project::from_project_args(&cmd.project_args)?.clean()?;

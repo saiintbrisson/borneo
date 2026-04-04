@@ -132,6 +132,7 @@ impl MavenRepositoryClient {
         &self,
         path: &str,
         accepted_mimes: &'static [&[u8]],
+        status_key: Option<&str>,
     ) -> Result<Content, ClientError> {
         use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -154,8 +155,10 @@ impl MavenRepositoryClient {
                 .await
                 .map_err(|e| match &e {
                     ClientError::Reqwest(_) | ClientError::IoError(_) => {
-                        crate::status::StatusHandle::get()
-                            .log(format!("retrying {}/{path}: {e}", self.base));
+                        let status = crate::status::StatusHandle::get();
+                        if let Some(key) = status_key {
+                            status.update(key, format!("retrying {key} ({e})"));
+                        }
                         backoff::Error::transient(e)
                     }
                     _ => backoff::Error::permanent(e),
@@ -208,22 +211,38 @@ impl MavenRepositoryClient {
         }
     }
 
-    pub async fn fetch_xml(&self, path: &str) -> Result<XmlFile, ClientError> {
+    pub async fn fetch_xml(
+        &self,
+        path: &str,
+        status_key: Option<&str>,
+    ) -> Result<XmlFile, ClientError> {
         const ACCEPTED_MIMES: &[&[u8]] = &[
             b"text/xml",
             b"application/xml",
             b"application/x-maven-pom+xml",
         ];
 
-        let content = self.execute_request(path, ACCEPTED_MIMES).await?;
+        let content = self.execute_request(path, ACCEPTED_MIMES, status_key).await?;
         let txt = String::from_utf8(content.content.to_vec())
             .map_err(|e| ClientError::ParseError(e.to_string()))?;
+
+        tokio::fs::write(
+            Utf8Path::new("build/cache/").join(Utf8Path::new(path).file_name().unwrap()),
+            &txt,
+        )
+        .await
+        .unwrap();
 
         XmlFile::from_str(&txt).map_err(|e| ClientError::ParseError(e.to_string()))
     }
 
-    pub async fn download_asset(&self, path: &str, out: &Utf8Path) -> Result<Asset, ClientError> {
-        let content = self.execute_request(path, &[]).await?;
+    pub async fn download_asset(
+        &self,
+        path: &str,
+        out: &Utf8Path,
+        status_key: Option<&str>,
+    ) -> Result<Asset, ClientError> {
+        let content = self.execute_request(path, &[], status_key).await?;
         let sha256 = <sha2::Sha256 as sha2::Digest>::digest(&content.content).to_vec();
         tokio::fs::write(out, &content.content).await?;
 

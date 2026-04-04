@@ -25,7 +25,11 @@ pub struct Manifest {
 
     pub resources: PathBuf,
 
+    pub java: JavaConfig,
+
     pub build: BuildConfig,
+
+    pub test: TestConfig,
 
     pub repositories: Repositories,
 
@@ -37,6 +41,28 @@ pub enum Packaging {
     Dir,
     #[default]
     Jar,
+}
+
+#[derive(Default)]
+pub struct JavaConfig {
+    pub release: Option<u32>,
+    pub compiler_args: Vec<String>,
+}
+
+pub struct TestConfig {
+    pub source: PathBuf,
+    pub resources: PathBuf,
+    pub jvm_args: Vec<String>,
+}
+
+impl Default for TestConfig {
+    fn default() -> Self {
+        Self {
+            source: PathBuf::from("src/test/java"),
+            resources: PathBuf::from("src/test/resources"),
+            jvm_args: Vec::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -79,14 +105,17 @@ pub enum Scope {
     Compile,
     Runtime,
     Provided,
+    Processor,
+    Test,
 }
 
 impl Scope {
     fn rank(self) -> u8 {
         match self {
-            Self::Compile => 2,
-            Self::Runtime => 1,
-            Self::Provided => 0,
+            Self::Compile => 4,
+            Self::Runtime => 3,
+            Self::Provided | Self::Processor => 2,
+            Self::Test => 0,
         }
     }
 }
@@ -109,6 +138,8 @@ impl std::fmt::Display for Scope {
             Self::Compile => f.write_str("compile"),
             Self::Runtime => f.write_str("runtime"),
             Self::Provided => f.write_str("provided"),
+            Self::Processor => f.write_str("processor"),
+            Self::Test => f.write_str("test"),
         }
     }
 }
@@ -121,6 +152,8 @@ impl std::str::FromStr for Scope {
             "compile" => Ok(Self::Compile),
             "runtime" => Ok(Self::Runtime),
             "provided" => Ok(Self::Provided),
+            "processor" => Ok(Self::Processor),
+            "test" => Ok(Self::Test),
             other => anyhow::bail!("unknown scope: {other}"),
         }
     }
@@ -158,12 +191,36 @@ pub fn mediate(parent_scope: Scope, pom_scope: PomScope) -> Scope {
         (Scope::Compile, PomScope::Compile) => Scope::Compile,
         (Scope::Compile, PomScope::Runtime) => Scope::Runtime,
         (Scope::Provided, _) => Scope::Provided,
+        (Scope::Processor, _) => Scope::Processor,
         (Scope::Runtime, _) => Scope::Runtime,
+        (Scope::Test, _) => Scope::Test,
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArtifactType(pub(crate) String);
+
+impl Default for ArtifactType {
+    fn default() -> Self {
+        Self("jar".into())
+    }
+}
+
+impl ArtifactType {
+    pub fn extension(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ArtifactType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
 pub struct Dependency {
     pub scope: Scope,
+    pub artifact_type: ArtifactType,
     pub source: DependencySource,
     pub exclusions: BTreeSet<ArtifactKey>,
 }
@@ -207,6 +264,8 @@ impl Manifest {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("src/main/resources"));
 
+        let java = parse_java_config(&doc, &src)?;
+        let test = parse_test_config(&doc);
         let build = parse_build_config(&doc, &src)?;
         let repositories = parse_repositories(&doc);
         let dependencies = parse_dependencies(&doc, &src)?;
@@ -220,7 +279,9 @@ impl Manifest {
             entry,
             source: source_path,
             resources,
+            java,
             build,
+            test,
             repositories,
             dependencies,
         })
@@ -275,7 +336,8 @@ fn optional_string_arg(doc: &KdlDocument, name: &str) -> Option<String> {
 fn parse_kdl_bool(val: &KdlValue) -> Option<bool> {
     match val {
         KdlValue::Bool(b) => Some(*b),
-        KdlValue::String(s) => s.parse::<bool>().ok(),
+        KdlValue::String(s) if s == "true" => Some(true),
+        KdlValue::String(s) if s == "false" => Some(false),
         _ => None,
     }
 }
@@ -302,6 +364,78 @@ fn parse_repositories(doc: &KdlDocument) -> Repositories {
         }
     }
     repos
+}
+
+fn parse_test_config(doc: &KdlDocument) -> TestConfig {
+    let Some(node) = doc.get("test") else {
+        return TestConfig::default();
+    };
+
+    let source = optional_string_arg_node(node, "source")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("src/test/java"));
+    let resources = optional_string_arg_node(node, "resources")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("src/test/resources"));
+
+    let jvm_args = node
+        .children()
+        .into_iter()
+        .flat_map(|c| c.nodes().iter().filter(|n| n.name().value() == "jvm-args"))
+        .filter_map(|n| n.entry(0))
+        .filter_map(|e| match e.value() {
+            KdlValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    TestConfig {
+        source,
+        resources,
+        jvm_args,
+    }
+}
+
+fn parse_java_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::Result<JavaConfig> {
+    let Some(node) = doc.get("java") else {
+        return Ok(JavaConfig::default());
+    };
+    let Some(children) = node.children() else {
+        return Ok(JavaConfig::default());
+    };
+
+    let release = if let Some(val) = children.get_arg("release") {
+        match val {
+            KdlValue::Integer(n) => Some(*n as u32),
+            KdlValue::String(s) => Some(s.parse::<u32>().map_err(|_| {
+                let span = children.get("release").unwrap().span();
+                miette::miette!(
+                    labels = vec![LabeledSpan::at(span, "expected an integer")],
+                    "invalid java release version: {s}"
+                )
+                .with_source_code(src.clone())
+            })?),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let compiler_args = children
+        .nodes()
+        .iter()
+        .filter(|n| n.name().value() == "compiler-args")
+        .filter_map(|n| n.entry(0))
+        .filter_map(|e| match e.value() {
+            KdlValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+
+    Ok(JavaConfig {
+        release,
+        compiler_args,
+    })
 }
 
 fn parse_build_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::Result<BuildConfig> {
@@ -368,10 +502,12 @@ fn parse_dependency(node: &KdlNode, src: &NamedSource<String>) -> miette::Result
         "compile" => Scope::Compile,
         "runtime" => Scope::Runtime,
         "provided" => Scope::Provided,
+        "processor" => Scope::Processor,
+        "test" => Scope::Test,
         other => {
             return Err(miette::miette!(
                 labels = vec![LabeledSpan::at(node.name().span(), "unknown scope")],
-                "unknown dependency scope: {other} (expected compile, runtime, or provided)"
+                "unknown dependency scope: {other} (expected compile, runtime, provided, processor, or test)"
             )
             .with_source_code(src.clone()));
         }
@@ -461,8 +597,17 @@ fn parse_dependency(node: &KdlNode, src: &NamedSource<String>) -> miette::Result
         }
     }
 
+    let artifact_type = node
+        .entry("type")
+        .and_then(|e| match e.value() {
+            KdlValue::String(s) => Some(ArtifactType(s.clone())),
+            _ => None,
+        })
+        .unwrap_or_default();
+
     Ok(Dependency {
         scope,
+        artifact_type,
         source,
         exclusions,
     })

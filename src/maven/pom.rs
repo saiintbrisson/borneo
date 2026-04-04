@@ -120,14 +120,20 @@ impl Exclusion {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum DependencyType {
-    #[default]
-    Jar,
-    TestJar,
-    Zip,
-    Pom,
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct DependencyType(String);
+
+impl Default for DependencyType {
+    fn default() -> Self {
+        Self("jar".into())
+    }
+}
+
+impl DependencyType {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]

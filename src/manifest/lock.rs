@@ -4,7 +4,7 @@ use anyhow::Context;
 use camino::Utf8PathBuf;
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
-use crate::manifest::{PomScope, Scope};
+use crate::manifest::{ArtifactType, PomScope, Scope};
 use crate::types::{ArtifactCoordinates, ArtifactKey};
 
 pub struct Lock {
@@ -24,7 +24,7 @@ pub struct LocalArtifact {
 pub struct LockArtifact {
     pub coord: ArtifactCoordinates,
     pub classifier: Option<String>,
-    pub artifact_type: Option<String>,
+    pub artifact_type: ArtifactType,
     pub source: String,
     pub artifact_path: Utf8PathBuf,
     pub checksum: Checksum,
@@ -151,7 +151,9 @@ fn parse_lock_artifact(node: &KdlNode) -> anyhow::Result<LockArtifact> {
         .parse()?;
 
     let classifier = node_prop_str(node, "classifier");
-    let artifact_type = node_prop_str(node, "type");
+    let artifact_type = node_prop_str(node, "type")
+        .map(|s| ArtifactType(s))
+        .unwrap_or_default();
 
     let effective_scope: Scope = node_prop_str(node, "scope")
         .and_then(|s| s.parse().ok())
@@ -227,8 +229,8 @@ impl LockArtifact {
         if let Some(c) = &self.classifier {
             push_prop(&mut node, "classifier", c);
         }
-        if let Some(t) = &self.artifact_type {
-            push_prop(&mut node, "type", t);
+        if self.artifact_type.extension() != "jar" {
+            push_prop(&mut node, "type", self.artifact_type.extension());
         }
 
         let has_children = !self.dependencies.is_empty() || !self.exclusions.is_empty();

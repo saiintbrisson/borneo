@@ -135,7 +135,9 @@ impl XmlNode {
                 Ok(Event::Start(e)) => {
                     let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                     let child = Self::parse(reader, buf);
-                    children.push((name, child));
+                    if !matches!(&child, XmlNode::Text(s) if s.trim().is_empty()) {
+                        children.push((name, child));
+                    }
                 }
                 Ok(Event::Text(e)) => {
                     text.push_str(std::str::from_utf8(&e).expect("XML text is not UTF-8"));
@@ -267,24 +269,23 @@ fn resolve_template_references(
                     continue;
                 }
 
-                let val = match trimmed.split_once('.') {
-                    Some(("project", path)) => {
-                        let Some(val) = root.find_str(path) else {
-                            missing.insert(trimmed.to_string());
-                            continue;
-                        };
-                        val
+                let val = if let Some(node) = root.get("properties")
+                    && let Some(XmlNode::Text(val)) = node.get(trimmed)
+                {
+                    Some(val.as_str())
+                } else {
+                    if let Some(("project", path)) = trimmed.split_once('.')
+                        && let Some(val) = root.find_str(path)
+                    {
+                        Some(val)
+                    } else {
+                        None
                     }
-                    _ => {
-                        if let Some(val) = root.get("properties")
-                            && let Some(XmlNode::Text(val)) = val.get(trimmed)
-                        {
-                            val
-                        } else {
-                            missing.insert(trimmed.to_string());
-                            continue;
-                        }
-                    }
+                };
+
+                let Some(val) = val else {
+                    missing.insert(trimmed.to_string());
+                    continue;
                 };
 
                 props.insert(trimmed.to_string(), val.to_string());
@@ -333,7 +334,7 @@ fn java_system_properties() -> BTreeMap<String, String> {
     let java_home = std::env::var("JAVA_HOME").unwrap_or_default();
     props.insert("java.home".into(), java_home.clone());
 
-    if let Some(version) = read_java_version(&java_home) {
+    if let Some(version) = crate::java::read_java_version(std::path::Path::new(&java_home)) {
         props.insert("java.version".into(), version);
     }
 
@@ -361,16 +362,6 @@ fn java_system_properties() -> BTreeMap<String, String> {
     );
 
     props
-}
-
-fn read_java_version(java_home: &str) -> Option<String> {
-    let release = std::fs::read_to_string(std::path::Path::new(java_home).join("release")).ok()?;
-    for line in release.lines() {
-        if let Some(val) = line.strip_prefix("JAVA_VERSION=") {
-            return Some(val.trim_matches('"').to_string());
-        }
-    }
-    None
 }
 
 mod de {

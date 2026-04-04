@@ -12,7 +12,7 @@ use futures_util::{TryFutureExt, future::join_all};
 use tokio::sync::watch;
 
 use crate::{
-    manifest::{PomScope, lock::Lock},
+    manifest::{ArtifactType, PomScope, lock::Lock},
     maven::{
         MAVEN_POM_SUFFIX, MavenRepositoryClient,
         pom::{Dependency, DependencyScope, Parent, Pom},
@@ -36,6 +36,7 @@ pub struct ResolvedArtifact {
     pub coord: ArtifactCoordinates,
     pub source: String,
     pub artifact_path: Utf8PathBuf,
+    pub artifact_type: ArtifactType,
     pub dependencies: BTreeMap<ArtifactCoordinates, PomScope>,
     pub depth: usize,
 }
@@ -73,11 +74,11 @@ pub struct MavenLoader {
     client: reqwest::Client,
     repos: Vec<Arc<MavenRepositoryClient>>,
 
+    semaphore: Arc<tokio::sync::Semaphore>,
     channel: (watch::Sender<Option<()>>, watch::Receiver<Option<()>>),
     loaded: Arc<Cache<ArtifactCoordinates, ResolvedArtifact>>,
-    /// Tracks which exclusion sets have been applied per coord to avoid
-    /// re-entering the same artifact with the same (or more restrictive) exclusions.
     seen_branches: DashMap<ArtifactCoordinates, Vec<BTreeSet<ArtifactKey>>>,
+    nearest_by_key: DashMap<ArtifactKey, usize>,
 
     metas: Cache<ArtifactCoordinates, Utf8PathBuf>,
     files: Cache<String, XmlFile>,
@@ -100,6 +101,7 @@ impl MavenLoader {
             .collect();
 
         Arc::new(Self {
+            semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             super_pom,
             repos: all_repos,
             client,
@@ -107,6 +109,7 @@ impl MavenLoader {
             channel: watch::channel(None),
             loaded: Default::default(),
             seen_branches: Default::default(),
+            nearest_by_key: Default::default(),
 
             metas: Default::default(),
             files: Default::default(),
@@ -192,6 +195,7 @@ impl MavenLoader {
                 coord: coord.clone(),
                 source: lock_artifact.source.clone(),
                 artifact_path: lock_artifact.artifact_path.clone(),
+                artifact_type: lock_artifact.artifact_type.clone(),
                 dependencies: lock_artifact.dependencies.clone(),
                 depth,
             });
@@ -217,6 +221,17 @@ impl MavenLoader {
         coord: ArtifactCoordinates,
         branch: LoaderBranch,
     ) -> anyhow::Result<()> {
+        let key = coord.key();
+        match self.nearest_by_key.entry(key) {
+            dashmap::Entry::Occupied(e) if *e.get() <= branch.depth => return Ok(()),
+            dashmap::Entry::Occupied(mut e) => {
+                e.insert(branch.depth);
+            }
+            dashmap::Entry::Vacant(e) => {
+                e.insert(branch.depth);
+            }
+        }
+
         let tx = match self.loaded.entry(coord.clone()) {
             dashmap::Entry::Occupied(entry) => {
                 if let CacheEntry::Loading(rx) = entry.get() {
@@ -232,14 +247,15 @@ impl MavenLoader {
                 }
 
                 if let Some(entry) = self.loaded.get(&coord)
-                    && let CacheEntry::Ready((_, artifact)) = &*entry {
-                        let existing_deps = artifact.dependencies.clone();
-                        let artifact_path = artifact.artifact_path.clone();
-                        drop(entry);
+                    && let CacheEntry::Ready((_, artifact)) = &*entry
+                {
+                    let existing_deps = artifact.dependencies.clone();
+                    let artifact_path = artifact.artifact_path.clone();
+                    drop(entry);
 
-                        self.merge_branch_deps(&coord, &artifact_path, &existing_deps, &branch)
-                            .await?;
-                    }
+                    self.merge_branch_deps(&coord, &artifact_path, &existing_deps, &branch)
+                        .await?;
+                }
 
                 return Ok(());
             }
@@ -254,7 +270,8 @@ impl MavenLoader {
         StatusHandle::get().resolving(&coord);
 
         let (repo, artifact_path) = self.resolve_coord(&coord).await?;
-        let (repo, pom) = self.fetch_pom(&repo, &artifact_path).await?;
+        let coord_str = coord.to_string();
+        let (repo, pom) = self.fetch_pom(&repo, &artifact_path, Some(&coord_str)).await?;
 
         let repo = repo.context("no repo found")?;
         let source = repo.base().to_string();
@@ -267,6 +284,7 @@ impl MavenLoader {
                 source,
                 coord: coord.clone(),
                 artifact_path: artifact_path.as_ref().clone(),
+                artifact_type: Default::default(),
                 dependencies: dep_coords,
                 depth: branch.depth,
             }),
@@ -288,7 +306,7 @@ impl MavenLoader {
     ) -> anyhow::Result<BTreeMap<ArtifactCoordinates, PomScope>> {
         let mut pom: Pom = pom
             .read_as()
-            .with_context(|| format!("failed to parse POM for {coord}"))?;
+            .map_err(|e| anyhow::anyhow!("failed to parse POM for {coord}: {e}"))?;
 
         if let Some(dependency_management) = &pom.dependency_management
             && pom.dependencies.iter().any(|dep| dep.version.is_none())
@@ -349,7 +367,7 @@ impl MavenLoader {
         existing_deps: &BTreeMap<ArtifactCoordinates, PomScope>,
         branch: &LoaderBranch,
     ) -> anyhow::Result<()> {
-        let (_, pom) = self.fetch_pom(&None, artifact_path).await?;
+        let (_, pom) = self.fetch_pom(&None, artifact_path, Some(&coord.to_string())).await?;
         let new_deps = self.resolve_pom_deps(coord, &pom, branch).await?;
 
         let added: BTreeMap<_, _> = new_deps
@@ -361,16 +379,18 @@ impl MavenLoader {
         }
 
         if let Some(mut entry) = self.loaded.get_mut(coord)
-            && let CacheEntry::Ready((_, ref mut artifact)) = *entry {
-                let merged = Arc::make_mut(artifact);
-                merged.dependencies.extend(added);
-            }
+            && let CacheEntry::Ready((_, ref mut artifact)) = *entry
+        {
+            let merged = Arc::make_mut(artifact);
+            merged.dependencies.extend(added);
+        }
 
         Ok(())
     }
 
     pub fn spawn_load_artifact(self: Arc<Self>, coord: ArtifactCoordinates, branch: LoaderBranch) {
         tokio::spawn(async move {
+            let _permit = self.semaphore.clone().acquire_owned().await;
             if let Err(e) = self.load_artifact(coord.clone(), branch).await {
                 StatusHandle::get().error(coord, e);
             }
@@ -415,9 +435,10 @@ pub struct ResolvedDependencies {
 }
 
 impl ResolvedDependencies {
-    pub async fn download_jar(
+    pub async fn download_artifact(
         &self,
         coord: &ArtifactCoordinates,
+        ext: &str,
         out: &Utf8Path,
     ) -> anyhow::Result<Vec<u8>> {
         let entry = self
@@ -430,9 +451,10 @@ impl ResolvedDependencies {
         };
 
         let repo = repo.expect("resolved artifact must have a source repo");
-        let jar_path = artifact.artifact_path.with_added_extension("jar");
+        let path = artifact.artifact_path.with_added_extension(ext);
+        let key = format!("dl:{coord}");
         let asset = repo
-            .download_asset(jar_path.as_str(), out)
+            .download_asset(path.as_str(), out, Some(&key))
             .await
             .with_context(|| format!("failed to download {coord}"))?;
 
@@ -466,10 +488,9 @@ impl MavenLoader {
                     let mut rx = rx.clone();
                     drop(entry);
 
-                    let val = rx
-                        .wait_for(|v| v.is_some())
-                        .await
-                        .map_err(|_| anyhow::anyhow!("cache loader dropped without producing a value"))?;
+                    let val = rx.wait_for(|v| v.is_some()).await.map_err(|_| {
+                        anyhow::anyhow!("cache loader dropped without producing a value")
+                    })?;
                     val.clone().context("cache entry resolved to None")
                 }
             },
@@ -548,19 +569,20 @@ impl MavenLoader {
         &self,
         repo_hint: &Option<Arc<MavenRepositoryClient>>,
         path: &Utf8Path,
+        status_key: Option<&str>,
     ) -> anyhow::Result<CacheValue<XmlFile>> {
         self.get_or_load(&self.files, path.to_string(), async {
             let path = path.with_added_extension(MAVEN_POM_SUFFIX);
 
             let mut results = if let Some(hint) = repo_hint {
                 vec![
-                    hint.fetch_xml(path.as_str())
+                    hint.fetch_xml(path.as_str(), status_key)
                         .await
                         .map(|res| (hint.clone(), res)),
                 ]
             } else {
                 join_all(self.repos.iter().map(|repo| {
-                    repo.fetch_xml(path.as_str())
+                    repo.fetch_xml(path.as_str(), status_key)
                         .map_ok(|res| (repo.clone(), res))
                 }))
                 .await
@@ -580,7 +602,7 @@ impl MavenLoader {
                     parent.version.context("parent POM must have version")?,
                 );
                 let (repo, path) = self.resolve_coord(&coord).await?;
-                let (_, parent) = Box::pin(self.fetch_pom(&repo, &path)).await?;
+                let (_, parent) = Box::pin(self.fetch_pom(&repo, &path, status_key)).await?;
 
                 xml.merge_pom(&parent);
                 xml.replace_templates(&Default::default());
@@ -603,7 +625,7 @@ impl MavenLoader {
                     import.version.context("import must have version")?,
                 );
                 let (repo, path) = self.resolve_coord(&coord).await?;
-                let (_, import) = Box::pin(self.fetch_pom(&repo, &path)).await?;
+                let (_, import) = Box::pin(self.fetch_pom(&repo, &path, status_key)).await?;
 
                 let Some(bom_dependencies) = import.get("dependencyManagement/dependencies") else {
                     continue;

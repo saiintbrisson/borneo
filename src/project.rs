@@ -19,6 +19,8 @@ use crate::{
     status,
 };
 
+const NATIVE_EXTENSIONS: &[&str] = &["dll", "so", "dylib"];
+
 pub struct Project {
     pub dir: PathBuf,
     pub out: PathBuf,
@@ -154,6 +156,25 @@ impl Project {
         self.class_path.keys()
     }
 
+    pub fn processor_path_iter(&self) -> impl Iterator<Item = &PathBuf> {
+        self.class_path
+            .iter()
+            .filter(|(_, scope)| matches!(scope, Scope::Processor))
+            .map(|(path, _)| path)
+    }
+
+    pub fn native_library_dirs(&self) -> BTreeSet<PathBuf> {
+        self.class_path
+            .keys()
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| NATIVE_EXTENSIONS.contains(&e))
+            })
+            .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+            .collect()
+    }
+
     fn resolve_resources(
         manifest: &Option<manifest::Manifest>,
         dir: &Path,
@@ -179,7 +200,7 @@ impl Project {
         }
     }
 
-    pub async fn build(&mut self) -> Result<Option<PathBuf>> {
+    async fn compile_main(&mut self) -> Result<(crate::java::Java, PathBuf)> {
         let mut files = Vec::with_capacity(1);
 
         for entry in walkdir::WalkDir::new(&self.source) {
@@ -199,15 +220,58 @@ impl Project {
         self.resolve_dependencies().await?;
         self.class_path.insert(self.source.clone(), Scope::Compile);
 
-        let status = status::StatusHandle::get();
         let java = crate::java::Java::new()?;
+
+        if let Some(manifest) = &self.manifest {
+            if let Some(required) = manifest.java.release {
+                let actual = java.major_version();
+                ensure!(
+                    actual.is_some_and(|v| v >= required),
+                    "project requires Java {required} but JAVA_HOME provides {}",
+                    actual.map_or("unknown".into(), |v| v.to_string()),
+                );
+            }
+        }
+
+        let compiler_args: Vec<_> = self
+            .manifest
+            .as_ref()
+            .map(|m| m.java.compiler_args.as_slice())
+            .unwrap_or_default()
+            .to_vec();
+
+        let build_dir = self.dir.join("build");
+        let classes_dir = build_dir.join("classes");
+
+        if classes_dir.exists() {
+            std::fs::remove_dir_all(&classes_dir)
+                .context("failed to clean classes directory")?;
+        }
+        std::fs::create_dir_all(&classes_dir)
+            .context("failed to create classes directory")?;
+
+        let status = status::StatusHandle::get();
+        let file_count = files.len();
+        let output = status.task(
+            "compile",
+            format!("compiling {file_count} source files"),
+            format!("compiled {file_count} source files"),
+            || java.javac(&self.dir, &classes_dir, self.class_path_iter(), self.processor_path_iter(), &files, &compiler_args),
+        )?;
+        flush_output(&output);
+
+        if let Some(resources) = &self.resources {
+            copy_dir_contents(resources, &classes_dir)?;
+        }
+
+        Ok((java, classes_dir))
+    }
+
+    pub async fn build(&mut self) -> Result<Option<PathBuf>> {
+        let (java, classes_dir) = self.compile_main().await?;
 
         match self.packaging {
             Packaging::Dir => {
-                status.begin("compile", format!("compiling {} source files", files.len()));
-                java.javac(&self.dir, &self.out, self.class_path_iter(), &files)?;
-                status.end("compile");
-                status.log(format!("compiled {} source files", files.len()));
                 if let Some(resources) = &self.resources {
                     self.class_path.insert(resources.clone(), Scope::Compile);
                 }
@@ -219,8 +283,6 @@ impl Project {
                     .as_ref()
                     .is_some_and(|m| m.build.shadow);
 
-                let build_dir = self.dir.join("build");
-                let classes_dir = build_dir.join("classes");
                 let jar_path = if self.out.extension().is_some_and(|ext| ext == "jar") {
                     self.out.clone()
                 } else {
@@ -233,33 +295,19 @@ impl Project {
                     self.out.join(jar_name)
                 };
 
-                if classes_dir.exists() {
-                    std::fs::remove_dir_all(&classes_dir)
-                        .context("failed to clean classes directory")?;
-                }
-                std::fs::create_dir_all(&classes_dir)
-                    .context("failed to create classes directory")?;
-
-                status.begin("compile", format!("compiling {} source files", files.len()));
-                java.javac(&self.dir, &classes_dir, self.class_path_iter(), &files)?;
-                status.end("compile");
-                status.log(format!("compiled {} source files", files.len()));
-
-                if let Some(resources) = &self.resources {
-                    copy_dir_contents(resources, &classes_dir)?;
-                }
+                let status = status::StatusHandle::get();
 
                 if shadow {
-                    status.begin("shadow", "bundling dependencies");
-                    for (path, scope) in &self.class_path {
-                        if matches!(scope, Scope::Compile | Scope::Runtime)
-                            && path.extension().is_some_and(|ext| ext == "jar")
-                        {
-                            unpack_jar(&java, path, &classes_dir)?;
+                    status.task("shadow", "bundling dependencies", "bundled dependencies into shadow jar", || {
+                        for (path, scope) in &self.class_path {
+                            if matches!(scope, Scope::Compile | Scope::Runtime)
+                                && path.extension().is_some_and(|ext| ext == "jar")
+                            {
+                                unpack_jar(&java, path, &classes_dir)?;
+                            }
                         }
-                    }
-                    status.end("shadow");
-                    status.log("bundled dependencies into shadow jar");
+                        Ok(())
+                    })?;
                 }
 
                 if jar_path.exists() {
@@ -268,17 +316,22 @@ impl Project {
                 }
 
                 let rel_jar = jar_path.strip_prefix(&self.dir).unwrap_or(&jar_path);
-                status.begin("package", format!("packaging {}", rel_jar.display()));
                 let entry = self.manifest.as_ref().and_then(|m| m.entry.as_deref());
-                java.jar(&self.dir, &classes_dir, &jar_path, entry)?;
-                status.end("package");
-                status.log(format!("packaged {}", rel_jar.display()));
+                let output = status.task(
+                    "package",
+                    format!("packaging {}", rel_jar.display()),
+                    format!("packaged {}", rel_jar.display()),
+                    || java.jar(&self.dir, &classes_dir, &jar_path, entry),
+                )?;
+                flush_output(&output);
 
                 if let Some(post_build) = self.manifest.as_ref().and_then(|m| m.build.post_build.as_deref()) {
-                    status.begin("post-build", format!("running: {post_build}"));
-                    let output = run_post_build(&self.dir, post_build, &jar_path)?;
-                    status.end("post-build");
-                    status.log(format!("post-build: {post_build}"));
+                    let output = status.task(
+                        "post-build",
+                        format!("running: {post_build}"),
+                        format!("post-build: {post_build}"),
+                        || run_post_build(&self.dir, post_build, &jar_path),
+                    )?;
                     status.output(output.stdout);
                     status.output(output.stderr);
                 }
@@ -301,6 +354,113 @@ impl Project {
                     .display()
             );
         }
+        Ok(())
+    }
+
+    pub async fn test(&mut self, cmd: &crate::cli::TestCommand) -> Result<()> {
+        ensure!(
+            self.manifest.is_some(),
+            "test requires a borneo.kdl manifest"
+        );
+
+        let (java, classes_dir) = self.compile_main().await?;
+        let manifest = self.manifest.as_ref().unwrap();
+
+        let standalone_jar = self
+            .class_path
+            .iter()
+            .find(|(path, scope)| {
+                matches!(scope, Scope::Test)
+                    && path
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .is_some_and(|f| {
+                            f.starts_with("org.junit.platform-junit-platform-console-standalone-")
+                        })
+            })
+            .map(|(path, _)| path.clone())
+            .context(
+                "test requires org.junit.platform:junit-platform-console-standalone as a test dependency",
+            )?;
+
+        let test_classes_dir = self.dir.join("build").join("test-classes");
+        if test_classes_dir.exists() {
+            std::fs::remove_dir_all(&test_classes_dir)
+                .context("failed to clean test-classes directory")?;
+        }
+        std::fs::create_dir_all(&test_classes_dir)
+            .context("failed to create test-classes directory")?;
+
+        let compiler_args: Vec<_> = manifest.java.compiler_args.clone();
+        let test_source = self.dir.join(&manifest.test.source);
+        ensure!(
+            test_source.is_dir(),
+            "test source directory does not exist: {}",
+            test_source.display()
+        );
+
+        let mut test_files = Vec::new();
+        for entry in walkdir::WalkDir::new(&test_source) {
+            let entry = entry.context("failed to walk test source directory")?;
+            if entry.file_type().is_file() {
+                test_files.push(
+                    entry
+                        .into_path()
+                        .canonicalize()
+                        .context("failed to canonicalize test file")?,
+                );
+            }
+        }
+
+        let status = status::StatusHandle::get();
+        let mut test_cp: Vec<_> = self.class_path_iter().cloned().collect();
+        test_cp.push(classes_dir.clone());
+
+        let test_file_count = test_files.len();
+        let output = status.task(
+            "compile-tests",
+            format!("compiling {test_file_count} test files"),
+            format!("compiled {test_file_count} test files"),
+            || java.javac(&self.dir, &test_classes_dir, test_cp.iter(), self.processor_path_iter(), &test_files, &compiler_args),
+        )?;
+        flush_output(&output);
+
+        let test_resources = self.dir.join(&manifest.test.resources);
+        if test_resources.is_dir() {
+            copy_dir_contents(&test_resources, &test_classes_dir)?;
+        }
+
+        let mut run_cp: Vec<PathBuf> = vec![classes_dir, test_classes_dir.clone()];
+        for (path, _) in &self.class_path {
+            if *path != standalone_jar {
+                run_cp.push(path.clone());
+            }
+        }
+
+        let mut filter_args = Vec::new();
+        if let Some(class) = &cmd.class {
+            filter_args.push(format!("--select-class={class}"));
+        }
+        if let Some(method) = &cmd.method {
+            filter_args.push(format!("--select-method={method}"));
+        }
+        if let Some(tag) = &cmd.tag {
+            filter_args.push(format!("--include-tag={tag}"));
+        }
+        if let Some(tag) = &cmd.exclude_tag {
+            filter_args.push(format!("--exclude-tag={tag}"));
+        }
+
+        status.log("running tests");
+        java.run_tests(
+            &self.dir,
+            &standalone_jar,
+            run_cp.iter(),
+            &test_classes_dir,
+            &manifest.test.jvm_args,
+            &filter_args,
+        )?;
+
         Ok(())
     }
 
@@ -455,13 +615,14 @@ async fn download_and_lock(
     let mut to_download = Vec::new();
 
     for artifact in &resolved.artifacts {
-        let jar_name = format!(
-            "{}-{}-{}.jar",
+        let ext = artifact.artifact_type.extension();
+        let file_name = format!(
+            "{}-{}-{}.{ext}",
             artifact.coord.group_id().as_str(),
             artifact.coord.artifact_id().as_str(),
             artifact.coord.version().as_str(),
         );
-        let out = cache_dir.join(&jar_name);
+        let out = cache_dir.join(&file_name);
 
         let expected_digest = prev_lock.as_ref().and_then(|lock| {
             lock.artifacts
@@ -485,7 +646,7 @@ async fn download_and_lock(
                 lock_artifacts.insert(LockArtifact {
                     coord: artifact.coord.clone(),
                     classifier: None,
-                    artifact_type: None,
+                    artifact_type: artifact.artifact_type.clone(),
                     source: artifact.source.clone(),
                     artifact_path: artifact.artifact_path.clone(),
                     checksum: Checksum::provided(digest.clone()),
@@ -497,7 +658,7 @@ async fn download_and_lock(
                 continue;
             }
 
-        to_download.push((artifact.clone(), out, exclusions, scope));
+        to_download.push((artifact.clone(), out, exclusions, scope, ext.to_string()));
     }
 
     if to_download.is_empty() {
@@ -509,14 +670,14 @@ async fn download_and_lock(
         });
     }
 
-    for (artifact, _, _, _) in &to_download {
+    for (artifact, _, _, _, _) in &to_download {
         status.downloading(&artifact.coord);
     }
 
     let results: Vec<anyhow::Result<_>> =
-        futures_util::stream::iter(to_download.iter().map(|(artifact, out, _, _)| async {
+        futures_util::stream::iter(to_download.iter().map(|(artifact, out, _, _, ext)| async {
             let out = Utf8PathBuf::from(out.to_string_lossy().to_string());
-            let sha256 = resolved.download_jar(&artifact.coord, &out).await?;
+            let sha256 = resolved.download_artifact(&artifact.coord, ext, &out).await?;
 
             status::StatusHandle::get().downloaded(&artifact.coord);
 
@@ -528,14 +689,14 @@ async fn download_and_lock(
 
     for result in results {
         let (coord, sha256) = result?;
-        let (artifact, out, exclusions, scope) = to_download
+        let (artifact, out, exclusions, scope, _) = to_download
             .iter()
-            .find(|(a, _, _, _)| a.coord == coord)
+            .find(|(a, _, _, _, _)| a.coord == coord)
             .context("download result does not match any queued artifact")?;
         lock_artifacts.insert(LockArtifact {
             coord,
             classifier: None,
-            artifact_type: None,
+            artifact_type: artifact.artifact_type.clone(),
             source: artifact.source.clone(),
             artifact_path: artifact.artifact_path.clone(),
             checksum: Checksum::provided(sha256),
@@ -569,6 +730,12 @@ fn write_lock(path: &Path, lock: &Lock) -> Result<()> {
     std::fs::write(path, lock.to_kdl()).context("failed to write lock file")
 }
 
+fn flush_output(output: &std::process::Output) {
+    let status = status::StatusHandle::get();
+    status.output(output.stdout.clone());
+    status.output(output.stderr.clone());
+}
+
 fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
     for entry in walkdir::WalkDir::new(src) {
         let entry = entry.context("failed to walk resources directory")?;
@@ -585,7 +752,8 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
 
 fn unpack_jar(java: &crate::java::Java, jar: &Path, dst: &Path) -> Result<()> {
     java.extract_jar(jar, dst)
-        .with_context(|| format!("failed to unpack {}", jar.display()))
+        .with_context(|| format!("failed to unpack {}", jar.display()))?;
+    Ok(())
 }
 
 fn run_post_build(dir: &Path, command: &str, jar_path: &Path) -> Result<std::process::Output> {

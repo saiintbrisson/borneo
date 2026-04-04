@@ -6,6 +6,7 @@ use crate::types::ArtifactCoordinates;
 
 pub(crate) enum Status {
     Begin { key: String, msg: String },
+    Update { key: String, msg: String },
     End(String),
     Error(String, anyhow::Error),
     Fatal(String),
@@ -48,6 +49,13 @@ impl StatusHandle {
         });
     }
 
+    pub fn update(&self, key: impl Into<String>, msg: impl Into<String>) {
+        self.send(Status::Update {
+            key: key.into(),
+            msg: msg.into(),
+        });
+    }
+
     pub fn end(&self, key: impl Into<String>) {
         self.send(Status::End(key.into()));
     }
@@ -78,6 +86,22 @@ impl StatusHandle {
 
     pub fn fatal(&self, msg: impl Into<String>) {
         self.send(Status::Fatal(msg.into()));
+    }
+
+    pub fn task<T>(
+        &self,
+        key: &str,
+        spinner_msg: impl Into<String>,
+        done_msg: impl Into<String>,
+        f: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.begin(key, spinner_msg);
+        let result = f();
+        self.end(key);
+        if result.is_ok() {
+            self.log(done_msg);
+        }
+        result
     }
 
     pub fn output(&self, bytes: Vec<u8>) {
@@ -134,6 +158,12 @@ impl ProgressDisplay {
         }
         match status {
             Status::Begin { key, msg } => self.push(key, msg),
+            Status::Update { key, msg } => {
+                if let Some((_, existing)) = self.queue.iter_mut().find(|(k, _)| k == &key) {
+                    *existing = msg;
+                    self.refresh();
+                }
+            }
             Status::End(key) => self.remove(&key),
             Status::Error(key, err) => {
                 self.remove(&key);

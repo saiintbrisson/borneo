@@ -19,6 +19,9 @@ pub enum Commands {
     /// Build and run the project
     #[command(alias = "r")]
     Run(RunCommand),
+    /// Run tests
+    #[command(alias = "t")]
+    Test(TestCommand),
     /// Remove build artifacts
     Clean(CleanCommand),
 }
@@ -53,6 +56,21 @@ pub struct BuildCommand {
 pub struct CleanCommand {
     #[command(flatten)]
     pub project_args: ProjectArgs,
+}
+
+#[derive(clap::Args)]
+pub struct TestCommand {
+    #[command(flatten)]
+    pub build_args: BuildArgs,
+
+    #[arg(long)]
+    pub class: Option<String>,
+    #[arg(long)]
+    pub method: Option<String>,
+    #[arg(long)]
+    pub tag: Option<String>,
+    #[arg(long)]
+    pub exclude_tag: Option<String>,
 }
 
 #[derive(clap::Args)]
