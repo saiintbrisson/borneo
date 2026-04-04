@@ -7,7 +7,7 @@ use indexmap::IndexSet;
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use miette::{LabeledSpan, NamedSource};
 
-use crate::types::{ArtifactCoordinates, ArtifactKey, ArtifactId, ArtifactVersion, GroupId};
+use crate::types::{ArtifactCoordinates, ArtifactId, ArtifactKey, ArtifactVersion, GroupId};
 
 pub mod lock;
 
@@ -72,7 +72,6 @@ pub struct BuildConfig {
     pub shadow: bool,
     pub post_build: Option<String>,
 }
-
 
 pub struct Repositories {
     pub central: bool,
@@ -557,10 +556,7 @@ fn parse_dependency(node: &KdlNode, src: &NamedSource<String>) -> miette::Result
         for child in children.nodes() {
             if child.name().value() != "exclude" {
                 return Err(miette::miette!(
-                    labels = vec![LabeledSpan::at(
-                        child.name().span(),
-                        "expected \"exclude\""
-                    )],
+                    labels = vec![LabeledSpan::at(child.name().span(), "expected \"exclude\"")],
                     "unexpected node in dependency block: {}",
                     child.name().value()
                 )

@@ -8,7 +8,7 @@ pub(crate) enum Status {
     Begin { key: String, msg: String },
     Update { key: String, msg: String },
     End(String),
-    Error(String, anyhow::Error),
+    Clear,
     Fatal(String),
     Log(String),
     Output(Vec<u8>),
@@ -76,8 +76,8 @@ impl StatusHandle {
         self.end(format!("dl:{coord}"));
     }
 
-    pub fn error(&self, coord: ArtifactCoordinates, err: anyhow::Error) {
-        self.send(Status::Error(coord.to_string(), err));
+    pub fn clear(&self) {
+        self.send(Status::Clear);
     }
 
     pub fn log(&self, msg: impl Into<String>) {
@@ -165,10 +165,9 @@ impl ProgressDisplay {
                 }
             }
             Status::End(key) => self.remove(&key),
-            Status::Error(key, err) => {
-                self.remove(&key);
-                self.multi.println(format!("✗ {key}: {err}")).ok();
-                self.fatal = Some(err);
+            Status::Clear => {
+                self.queue.clear();
+                self.refresh();
             }
             Status::Fatal(msg) => {
                 self.multi.println(msg).ok();

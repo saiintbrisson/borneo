@@ -45,6 +45,22 @@ pub enum ClientError {
     IoError(#[from] std::io::Error),
 }
 
+impl ClientError {
+    fn is_retryable(&self) -> bool {
+        match self {
+            Self::Reqwest(e) => {
+                if let Some(status) = e.status() {
+                    status.is_server_error() || status.as_u16() == 429
+                } else {
+                    true
+                }
+            }
+            Self::IoError(_) => true,
+            _ => false,
+        }
+    }
+}
+
 pub struct Asset {
     sha256: Vec<u8>,
 }
@@ -153,15 +169,15 @@ impl MavenRepositoryClient {
 
             self.try_execute_request(path, accepted_mimes, timeout)
                 .await
-                .map_err(|e| match &e {
-                    ClientError::Reqwest(_) | ClientError::IoError(_) => {
-                        let status = crate::status::StatusHandle::get();
-                        if let Some(key) = status_key {
-                            status.update(key, format!("retrying {key} ({e})"));
-                        }
-                        backoff::Error::transient(e)
+                .map_err(|e| {
+                    if !e.is_retryable() {
+                        return backoff::Error::permanent(e);
                     }
-                    _ => backoff::Error::permanent(e),
+                    let status = crate::status::StatusHandle::get();
+                    if let Some(key) = status_key {
+                        status.update(key, format!("retrying {key} ({e})"));
+                    }
+                    backoff::Error::transient(e)
                 })
         })
         .await
@@ -222,16 +238,11 @@ impl MavenRepositoryClient {
             b"application/x-maven-pom+xml",
         ];
 
-        let content = self.execute_request(path, ACCEPTED_MIMES, status_key).await?;
+        let content = self
+            .execute_request(path, ACCEPTED_MIMES, status_key)
+            .await?;
         let txt = String::from_utf8(content.content.to_vec())
             .map_err(|e| ClientError::ParseError(e.to_string()))?;
-
-        tokio::fs::write(
-            Utf8Path::new("build/cache/").join(Utf8Path::new(path).file_name().unwrap()),
-            &txt,
-        )
-        .await
-        .unwrap();
 
         XmlFile::from_str(&txt).map_err(|e| ClientError::ParseError(e.to_string()))
     }

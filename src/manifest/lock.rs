@@ -29,6 +29,8 @@ pub struct LockArtifact {
     pub artifact_path: Utf8PathBuf,
     pub checksum: Checksum,
     pub effective_scope: Scope,
+    pub depth: usize,
+    pub position: Vec<usize>,
     pub dependencies: BTreeMap<ArtifactCoordinates, PomScope>,
     pub exclusions: BTreeSet<ArtifactKey>,
 }
@@ -74,11 +76,12 @@ impl Lock {
 
         let mut repositories = BTreeSet::new();
         if let Some(repos_node) = doc.get("repositories")
-            && let Some(children) = repos_node.children() {
-                for node in children.nodes() {
-                    repositories.insert(node.name().value().to_string());
-                }
+            && let Some(children) = repos_node.children()
+        {
+            for node in children.nodes() {
+                repositories.insert(node.name().value().to_string());
             }
+        }
 
         let mut artifacts = BTreeSet::new();
         let mut local = BTreeSet::new();
@@ -152,12 +155,29 @@ fn parse_lock_artifact(node: &KdlNode) -> anyhow::Result<LockArtifact> {
 
     let classifier = node_prop_str(node, "classifier");
     let artifact_type = node_prop_str(node, "type")
-        .map(|s| ArtifactType(s))
+        .map(ArtifactType)
         .unwrap_or_default();
 
     let effective_scope: Scope = node_prop_str(node, "scope")
         .and_then(|s| s.parse().ok())
         .unwrap_or(Scope::Compile);
+
+    let depth = node
+        .entry("depth")
+        .and_then(|e| match e.value() {
+            KdlValue::Integer(n) => Some(*n as usize),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    let position = node_prop_str(node, "position")
+        .map(|s| {
+            s.split('.')
+                .filter(|p| !p.is_empty())
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut dependencies = BTreeMap::new();
     let mut exclusions = BTreeSet::new();
@@ -195,6 +215,8 @@ fn parse_lock_artifact(node: &KdlNode) -> anyhow::Result<LockArtifact> {
         artifact_path,
         checksum,
         effective_scope,
+        depth,
+        position,
         dependencies,
         exclusions,
     })
@@ -225,6 +247,20 @@ impl LockArtifact {
         push_prop(&mut node, "path", self.artifact_path.as_str());
         push_prop(&mut node, "checksum", &self.checksum.to_string());
         push_prop(&mut node, "scope", &self.effective_scope.to_string());
+
+        let mut depth_entry = KdlEntry::new(KdlValue::Integer(self.depth as i128));
+        depth_entry.set_name(Some(kdl::KdlIdentifier::from("depth")));
+        node.entries_mut().push(depth_entry);
+
+        if !self.position.is_empty() {
+            let pos_str = self
+                .position
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(".");
+            push_prop(&mut node, "position", &pos_str);
+        }
 
         if let Some(c) = &self.classifier {
             push_prop(&mut node, "classifier", c);

@@ -10,13 +10,12 @@ use futures_util::StreamExt;
 use crate::{
     cli::{BuildArgs, ProjectArgs},
     manifest::{
-        Scope,
-        self, Packaging,
+        self, Packaging, Scope,
         lock::{self, Checksum, Lock, LockArtifact},
     },
     maven::loader::{LoaderBranch, MavenLoader, ResolvedDependencies, verify_cached},
-    types::ArtifactCoordinates,
     status,
+    types::ArtifactCoordinates,
 };
 
 const NATIVE_EXTENSIONS: &[&str] = &["dll", "so", "dylib"];
@@ -48,21 +47,17 @@ impl Project {
     }
 
     fn load_manifest(project: &ProjectArgs) -> Result<Option<manifest::Manifest>> {
-        let manifest_path = project
-            .manifest
-            .as_deref()
-            .unwrap_or("borneo.kdl".as_ref());
+        let manifest_path = project.manifest.as_deref().unwrap_or("borneo.kdl".as_ref());
         if manifest_path.is_file() {
             let source = std::fs::read_to_string(manifest_path)
                 .with_context(|| format!("failed to read manifest: {}", manifest_path.display()))?;
             let name = manifest_path.display().to_string();
-            Ok(Some(
-                manifest::Manifest::parse(&source, &name)
-                    .map_err(|e| {
-                        status::StatusHandle::get().fatal(format!("{e:?}"));
-                        anyhow::anyhow!("")
-                    })?,
-            ))
+            Ok(Some(manifest::Manifest::parse(&source, &name).map_err(
+                |e| {
+                    status::StatusHandle::get().fatal(format!("{e:?}"));
+                    anyhow::anyhow!("")
+                },
+            )?))
         } else {
             Ok(None)
         }
@@ -100,7 +95,12 @@ impl Project {
             .out
             .as_ref()
             .map(|o| o.to_path_buf())
-            .or_else(|| manifest.as_ref().and_then(|m| m.build.output.clone()).map(|o| dir.join(o)))
+            .or_else(|| {
+                manifest
+                    .as_ref()
+                    .and_then(|m| m.build.output.clone())
+                    .map(|o| dir.join(o))
+            })
             .unwrap_or_else(|| dir.join("build"));
 
         if out.extension().is_some_and(|ext| ext == "jar") {
@@ -116,7 +116,11 @@ impl Project {
 
         let packaging = build.packaging.unwrap_or_else(|| {
             if let Some(m) = &manifest {
-                if m.build.output.as_ref().is_some_and(|o| o.extension().is_some_and(|ext| ext == "jar")) {
+                if m.build
+                    .output
+                    .as_ref()
+                    .is_some_and(|o| o.extension().is_some_and(|ext| ext == "jar"))
+                {
                     return Packaging::Jar;
                 }
                 m.build.packaging
@@ -222,18 +226,18 @@ impl Project {
 
         let java = crate::java::Java::new()?;
 
-        if let Some(manifest) = &self.manifest {
-            if let Some(required) = manifest.java.release {
-                let actual = java.major_version();
-                ensure!(
-                    actual.is_some_and(|v| v >= required),
-                    "project requires Java {required} but JAVA_HOME provides {}",
-                    actual.map_or("unknown".into(), |v| v.to_string()),
-                );
-            }
+        if let Some(manifest) = &self.manifest
+            && let Some(required) = manifest.java.release
+        {
+            let actual = java.major_version();
+            ensure!(
+                actual.is_some_and(|v| v >= required),
+                "project requires Java {required} but JAVA_HOME provides {}",
+                actual.map_or("unknown".into(), |v| v.to_string()),
+            );
         }
 
-        let compiler_args: Vec<_> = self
+        let compiler_args = self
             .manifest
             .as_ref()
             .map(|m| m.java.compiler_args.as_slice())
@@ -244,11 +248,9 @@ impl Project {
         let classes_dir = build_dir.join("classes");
 
         if classes_dir.exists() {
-            std::fs::remove_dir_all(&classes_dir)
-                .context("failed to clean classes directory")?;
+            std::fs::remove_dir_all(&classes_dir).context("failed to clean classes directory")?;
         }
-        std::fs::create_dir_all(&classes_dir)
-            .context("failed to create classes directory")?;
+        std::fs::create_dir_all(&classes_dir).context("failed to create classes directory")?;
 
         let status = status::StatusHandle::get();
         let file_count = files.len();
@@ -256,7 +258,16 @@ impl Project {
             "compile",
             format!("compiling {file_count} source files"),
             format!("compiled {file_count} source files"),
-            || java.javac(&self.dir, &classes_dir, self.class_path_iter(), self.processor_path_iter(), &files, &compiler_args),
+            || {
+                java.javac(
+                    &self.dir,
+                    &classes_dir,
+                    self.class_path_iter(),
+                    self.processor_path_iter(),
+                    &files,
+                    &compiler_args,
+                )
+            },
         )?;
         flush_output(&output);
 
@@ -278,10 +289,7 @@ impl Project {
                 Ok(None)
             }
             Packaging::Jar => {
-                let shadow = self
-                    .manifest
-                    .as_ref()
-                    .is_some_and(|m| m.build.shadow);
+                let shadow = self.manifest.as_ref().is_some_and(|m| m.build.shadow);
 
                 let jar_path = if self.out.extension().is_some_and(|ext| ext == "jar") {
                     self.out.clone()
@@ -298,16 +306,21 @@ impl Project {
                 let status = status::StatusHandle::get();
 
                 if shadow {
-                    status.task("shadow", "bundling dependencies", "bundled dependencies into shadow jar", || {
-                        for (path, scope) in &self.class_path {
-                            if matches!(scope, Scope::Compile | Scope::Runtime)
-                                && path.extension().is_some_and(|ext| ext == "jar")
-                            {
-                                unpack_jar(&java, path, &classes_dir)?;
+                    status.task(
+                        "shadow",
+                        "bundling dependencies",
+                        "bundled dependencies into shadow jar",
+                        || {
+                            for (path, scope) in &self.class_path {
+                                if matches!(scope, Scope::Compile | Scope::Runtime)
+                                    && path.extension().is_some_and(|ext| ext == "jar")
+                                {
+                                    unpack_jar(&java, path, &classes_dir)?;
+                                }
                             }
-                        }
-                        Ok(())
-                    })?;
+                            Ok(())
+                        },
+                    )?;
                 }
 
                 if jar_path.exists() {
@@ -325,7 +338,11 @@ impl Project {
                 )?;
                 flush_output(&output);
 
-                if let Some(post_build) = self.manifest.as_ref().and_then(|m| m.build.post_build.as_deref()) {
+                if let Some(post_build) = self
+                    .manifest
+                    .as_ref()
+                    .and_then(|m| m.build.post_build.as_deref())
+                {
                     let output = status.task(
                         "post-build",
                         format!("running: {post_build}"),
@@ -391,7 +408,7 @@ impl Project {
         std::fs::create_dir_all(&test_classes_dir)
             .context("failed to create test-classes directory")?;
 
-        let compiler_args: Vec<_> = manifest.java.compiler_args.clone();
+        let compiler_args = manifest.java.compiler_args.clone();
         let test_source = self.dir.join(&manifest.test.source);
         ensure!(
             test_source.is_dir(),
@@ -421,7 +438,16 @@ impl Project {
             "compile-tests",
             format!("compiling {test_file_count} test files"),
             format!("compiled {test_file_count} test files"),
-            || java.javac(&self.dir, &test_classes_dir, test_cp.iter(), self.processor_path_iter(), &test_files, &compiler_args),
+            || {
+                java.javac(
+                    &self.dir,
+                    &test_classes_dir,
+                    test_cp.iter(),
+                    self.processor_path_iter(),
+                    &test_files,
+                    &compiler_args,
+                )
+            },
         )?;
         flush_output(&output);
 
@@ -430,8 +456,8 @@ impl Project {
             copy_dir_contents(&test_resources, &test_classes_dir)?;
         }
 
-        let mut run_cp: Vec<PathBuf> = vec![classes_dir, test_classes_dir.clone()];
-        for (path, _) in &self.class_path {
+        let mut run_cp = vec![classes_dir, test_classes_dir.clone()];
+        for path in self.class_path.keys() {
             if *path != standalone_jar {
                 run_cp.push(path.clone());
             }
@@ -496,7 +522,7 @@ impl Project {
         }
 
         let repo_urls = manifest.repositories.urls();
-        let resolved = resolve_artifacts(manifest, &prev_lock, &repo_urls).await;
+        let resolved = resolve_artifacts(manifest, &prev_lock, &repo_urls).await?;
         let mut lock = download_and_lock(
             &mut self.class_path,
             manifest,
@@ -517,7 +543,7 @@ async fn resolve_artifacts(
     manifest: &manifest::Manifest,
     prev_lock: &Option<Lock>,
     repo_urls: &[String],
-) -> ResolvedDependencies {
+) -> Result<ResolvedDependencies> {
     let loader = MavenLoader::new(repo_urls);
 
     if let Some(lock) = prev_lock {
@@ -532,16 +558,17 @@ async fn resolve_artifacts(
         ));
     }
 
-    for dep in &manifest.dependencies {
+    for (i, dep) in manifest.dependencies.iter().enumerate() {
         let Some(coord) = dep.coord() else {
             continue;
         };
         loader
             .clone()
-            .spawn_load_artifact(coord.clone(), LoaderBranch::new(dep.exclusions.clone()));
+            .spawn_load_artifact(coord.clone(), LoaderBranch::new(dep.exclusions.clone(), i));
     }
 
-    let resolved = loader.into_resolved().await;
+    let resolved = loader.into_resolved().await?;
+    status.clear();
 
     if !manifest.dependencies.is_empty() {
         status.log(format!(
@@ -551,7 +578,7 @@ async fn resolve_artifacts(
         ));
     }
 
-    resolved
+    Ok(resolved)
 }
 
 fn compute_effective_scopes(
@@ -642,21 +669,25 @@ async fn download_and_lock(
             .unwrap_or(Scope::Compile);
 
         if let Some(digest) = &expected_digest
-            && verify_cached(&out, digest) {
-                lock_artifacts.insert(LockArtifact {
-                    coord: artifact.coord.clone(),
-                    classifier: None,
-                    artifact_type: artifact.artifact_type.clone(),
-                    source: artifact.source.clone(),
-                    artifact_path: artifact.artifact_path.clone(),
-                    checksum: Checksum::provided(digest.clone()),
-                    effective_scope: scope,
-                    dependencies: artifact.dependencies.clone(),
-                    exclusions,
-                });
-                class_path.insert(out, scope);
-                continue;
-            }
+            && verify_cached(&out, digest)
+        {
+            let (rank, _, _) = resolved.slot_map.get(&artifact.coord.key()).unwrap();
+            lock_artifacts.insert(LockArtifact {
+                coord: artifact.coord.clone(),
+                classifier: None,
+                artifact_type: artifact.artifact_type.clone(),
+                source: artifact.source.clone(),
+                artifact_path: artifact.artifact_path.clone(),
+                checksum: Checksum::provided(digest.clone()),
+                effective_scope: scope,
+                depth: rank.0,
+                position: rank.1.clone(),
+                dependencies: artifact.dependencies.clone(),
+                exclusions,
+            });
+            class_path.insert(out, scope);
+            continue;
+        }
 
         to_download.push((artifact.clone(), out, exclusions, scope, ext.to_string()));
     }
@@ -677,13 +708,15 @@ async fn download_and_lock(
     let results: Vec<anyhow::Result<_>> =
         futures_util::stream::iter(to_download.iter().map(|(artifact, out, _, _, ext)| async {
             let out = Utf8PathBuf::from(out.to_string_lossy().to_string());
-            let sha256 = resolved.download_artifact(&artifact.coord, ext, &out).await?;
+            let sha256 = resolved
+                .download_artifact(&artifact.coord, ext, &out)
+                .await?;
 
             status::StatusHandle::get().downloaded(&artifact.coord);
 
             Ok((artifact.coord.clone(), sha256))
         }))
-        .buffer_unordered(4)
+        .buffer_unordered(8)
         .collect()
         .await;
 
@@ -693,6 +726,7 @@ async fn download_and_lock(
             .iter()
             .find(|(a, _, _, _, _)| a.coord == coord)
             .context("download result does not match any queued artifact")?;
+        let (rank, _, _) = resolved.slot_map.get(&coord.key()).unwrap();
         lock_artifacts.insert(LockArtifact {
             coord,
             classifier: None,
@@ -701,6 +735,8 @@ async fn download_and_lock(
             artifact_path: artifact.artifact_path.clone(),
             checksum: Checksum::provided(sha256),
             effective_scope: *scope,
+            depth: rank.0,
+            position: rank.1.clone(),
             dependencies: artifact.dependencies.clone(),
             exclusions: exclusions.clone(),
         });
@@ -764,7 +800,12 @@ fn run_post_build(dir: &Path, command: &str, jar_path: &Path) -> Result<std::pro
         .arg(flag)
         .arg(command)
         .current_dir(dir)
-        .env("BORNEO_BUILD_OUTPUT", jar_path.canonicalize().unwrap_or_else(|_| jar_path.to_path_buf()))
+        .env(
+            "BORNEO_BUILD_OUTPUT",
+            jar_path
+                .canonicalize()
+                .unwrap_or_else(|_| jar_path.to_path_buf()),
+        )
         .output()
         .with_context(|| format!("failed to run post-build: {command}"))?;
 

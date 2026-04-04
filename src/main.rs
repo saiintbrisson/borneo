@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
     }
     eprintln!();
 
-    result
+    std::process::exit(if result.is_ok() { 0 } else { 1 });
 }
 
 async fn run(cli: Cli) -> Result<()> {

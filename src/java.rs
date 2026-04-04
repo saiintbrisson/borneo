@@ -74,14 +74,14 @@ impl Java {
 
         cmd.arg("-d").arg(out);
 
-        let class_path = class_path.map(|cp| cp.as_os_str()).collect::<Vec<_>>();
+        let class_path: Vec<_> = class_path.map(|cp| cp.as_os_str()).collect();
         let class_path = class_path.join(&OsString::from(PATH_SEPARATOR));
 
         if !class_path.is_empty() {
             cmd.arg("--class-path").arg(class_path);
         }
 
-        let proc_path = processor_path.map(|p| p.as_os_str()).collect::<Vec<_>>();
+        let proc_path: Vec<_> = processor_path.map(|p| p.as_os_str()).collect();
         let proc_path = proc_path.join(&OsString::from(PATH_SEPARATOR));
 
         if !proc_path.is_empty() {
@@ -136,7 +136,7 @@ impl Java {
 
         let mut final_class_path = out.as_os_str().to_owned();
 
-        let class_path = class_path.map(|cp| cp.as_os_str()).collect::<Vec<_>>();
+        let class_path: Vec<_> = class_path.map(|cp| cp.as_os_str()).collect();
         let class_path = class_path.join(&OsString::from(PATH_SEPARATOR));
 
         if !class_path.is_empty() {
@@ -167,7 +167,7 @@ impl Java {
 
         cmd.arg("execute");
 
-        let cp = class_path.map(|p| p.as_os_str()).collect::<Vec<_>>();
+        let cp: Vec<_> = class_path.map(|p| p.as_os_str()).collect();
         let cp = cp.join(&OsString::from(PATH_SEPARATOR));
         if !cp.is_empty() {
             cmd.arg("--class-path").arg(cp);

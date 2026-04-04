@@ -127,7 +127,7 @@ impl XmlNode {
     }
 
     fn parse(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>) -> Self {
-        let mut children: Vec<_> = Vec::new();
+        let mut children = Vec::new();
         let mut text = String::new();
 
         loop {

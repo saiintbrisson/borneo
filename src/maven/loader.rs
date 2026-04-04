@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque, hash_map},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
@@ -25,10 +25,19 @@ use crate::{
 type Cache<K, V> = DashMap<K, CacheEntry<V>>;
 type CacheValue<V> = (Option<Arc<MavenRepositoryClient>>, Arc<V>);
 
-#[derive(Clone, Debug)]
+type Rank = (usize, Vec<usize>);
+
+#[derive(Clone)]
 enum CacheEntry<V> {
     Ready(CacheValue<V>),
+    Failed(Arc<anyhow::Error>),
     Loading(watch::Receiver<Option<CacheValue<V>>>),
+}
+
+#[derive(Clone)]
+struct ArtifactSlot {
+    rank: Rank,
+    entry: CacheEntry<ResolvedArtifact>,
 }
 
 #[derive(Clone, Debug)]
@@ -38,29 +47,33 @@ pub struct ResolvedArtifact {
     pub artifact_path: Utf8PathBuf,
     pub artifact_type: ArtifactType,
     pub dependencies: BTreeMap<ArtifactCoordinates, PomScope>,
-    pub depth: usize,
 }
 
 #[derive(Clone)]
 pub struct LoaderBranch {
-    depth: usize,
+    pub depth: usize,
     exclusions: BTreeSet<ArtifactKey>,
+    position: Vec<usize>,
 }
 
 impl LoaderBranch {
-    pub fn new(exclusions: BTreeSet<ArtifactKey>) -> Self {
+    pub fn new(exclusions: BTreeSet<ArtifactKey>, position: usize) -> Self {
         Self {
             depth: 0,
             exclusions,
+            position: vec![position],
         }
     }
 
-    fn child(&self, extra_exclusions: impl IntoIterator<Item = ArtifactKey>) -> Self {
+    fn child(&self, index: usize, extra_exclusions: impl IntoIterator<Item = ArtifactKey>) -> Self {
         let mut exclusions = self.exclusions.clone();
         exclusions.extend(extra_exclusions);
+        let mut position = self.position.clone();
+        position.push(index);
         Self {
             depth: self.depth + 1,
             exclusions,
+            position,
         }
     }
 
@@ -74,11 +87,8 @@ pub struct MavenLoader {
     client: reqwest::Client,
     repos: Vec<Arc<MavenRepositoryClient>>,
 
-    semaphore: Arc<tokio::sync::Semaphore>,
     channel: (watch::Sender<Option<()>>, watch::Receiver<Option<()>>),
-    loaded: Arc<Cache<ArtifactCoordinates, ResolvedArtifact>>,
-    seen_branches: DashMap<ArtifactCoordinates, Vec<BTreeSet<ArtifactKey>>>,
-    nearest_by_key: DashMap<ArtifactKey, usize>,
+    artifacts: Arc<DashMap<ArtifactKey, ArtifactSlot>>,
 
     metas: Cache<ArtifactCoordinates, Utf8PathBuf>,
     files: Cache<String, XmlFile>,
@@ -101,15 +111,12 @@ impl MavenLoader {
             .collect();
 
         Arc::new(Self {
-            semaphore: Arc::new(tokio::sync::Semaphore::new(10)),
             super_pom,
             repos: all_repos,
             client,
 
             channel: watch::channel(None),
-            loaded: Default::default(),
-            seen_branches: Default::default(),
-            nearest_by_key: Default::default(),
+            artifacts: Default::default(),
 
             metas: Default::default(),
             files: Default::default(),
@@ -127,60 +134,19 @@ impl MavenLoader {
             return;
         }
 
-        let by_coord: HashMap<_, _> = lock.artifacts.iter().map(|a| (&a.coord, a)).collect();
-
-        let mut depths: HashMap<_, _> = HashMap::new();
-        let mut queue: VecDeque<(ArtifactCoordinates, usize, BTreeSet<ArtifactKey>)> =
-            VecDeque::new();
-
         for dep in deps {
             let Some(coord) = dep.coord() else { continue };
-            let Some(lock_artifact) = by_coord.get(coord) else {
+            let Some(lock_artifact) = lock.artifacts.iter().find(|a| a.coord == *coord) else {
                 continue;
             };
-
             if lock_artifact.exclusions != dep.exclusions {
-                continue;
-            }
-
-            queue.push_back((coord.clone(), 0, dep.exclusions.clone()));
-        }
-
-        while let Some((coord, depth, exclusions)) = queue.pop_front() {
-            match depths.entry(coord.clone()) {
-                hash_map::Entry::Occupied(e) if *e.get() <= depth => continue,
-                hash_map::Entry::Occupied(mut e) => {
-                    e.insert(depth);
-                }
-                hash_map::Entry::Vacant(e) => {
-                    e.insert(depth);
-                }
-            }
-
-            if let Some(lock_artifact) = by_coord.get(&coord) {
-                for dep_coord in lock_artifact.dependencies.keys() {
-                    if !exclusions.contains(&dep_coord.key()) {
-                        queue.push_back((dep_coord.clone(), depth + 1, exclusions.clone()));
-                    }
-                }
+                return;
             }
         }
 
-        // Mark all seeded coords so load_artifact skips the merge for them.
-        // Seeded entries already have correct dep lists from the lock.
-        // Using empty exclusions (most permissive) so any branch is dominated.
-        let empty = BTreeSet::new();
-        for coord in depths.keys() {
-            self.mark_branch(coord, &empty);
-        }
+        let mut repos = HashMap::new();
 
-        let mut repos = HashMap::<_, Arc<MavenRepositoryClient>>::new();
-
-        for (coord, depth) in depths {
-            let Some(lock_artifact) = by_coord.get(&coord) else {
-                continue;
-            };
-
+        for lock_artifact in &lock.artifacts {
             let repo = repos
                 .entry(lock_artifact.source.clone())
                 .or_insert_with(|| {
@@ -191,29 +157,24 @@ impl MavenLoader {
                 })
                 .clone();
 
+            let rank: Rank = (lock_artifact.depth, lock_artifact.position.clone());
+
             let resolved = Arc::new(ResolvedArtifact {
-                coord: coord.clone(),
+                coord: lock_artifact.coord.clone(),
                 source: lock_artifact.source.clone(),
                 artifact_path: lock_artifact.artifact_path.clone(),
                 artifact_type: lock_artifact.artifact_type.clone(),
                 dependencies: lock_artifact.dependencies.clone(),
-                depth,
             });
 
-            self.loaded
-                .insert(coord, CacheEntry::Ready((Some(repo), resolved)));
+            self.artifacts.insert(
+                lock_artifact.coord.key(),
+                ArtifactSlot {
+                    rank,
+                    entry: CacheEntry::Ready((Some(repo), resolved)),
+                },
+            );
         }
-    }
-
-    fn mark_branch(&self, coord: &ArtifactCoordinates, exclusions: &BTreeSet<ArtifactKey>) -> bool {
-        let mut entry = self.seen_branches.entry(coord.clone()).or_default();
-        let dominated = entry.iter().any(|seen| seen.is_subset(exclusions));
-        if dominated {
-            return true;
-        }
-        entry.retain(|seen| !exclusions.is_subset(seen));
-        entry.push(exclusions.clone());
-        false
     }
 
     async fn load_artifact(
@@ -222,47 +183,24 @@ impl MavenLoader {
         branch: LoaderBranch,
     ) -> anyhow::Result<()> {
         let key = coord.key();
-        match self.nearest_by_key.entry(key) {
-            dashmap::Entry::Occupied(e) if *e.get() <= branch.depth => return Ok(()),
+        let rank: Rank = (branch.depth, branch.position.clone());
+
+        let tx = match self.artifacts.entry(key.clone()) {
+            dashmap::Entry::Occupied(e) if e.get().rank <= rank => return Ok(()),
             dashmap::Entry::Occupied(mut e) => {
-                e.insert(branch.depth);
+                let (tx, rx) = watch::channel(None);
+                e.insert(ArtifactSlot {
+                    rank: rank.clone(),
+                    entry: CacheEntry::Loading(rx),
+                });
+                tx
             }
             dashmap::Entry::Vacant(e) => {
-                e.insert(branch.depth);
-            }
-        }
-
-        let tx = match self.loaded.entry(coord.clone()) {
-            dashmap::Entry::Occupied(entry) => {
-                if let CacheEntry::Loading(rx) = entry.get() {
-                    let mut rx = rx.clone();
-                    drop(entry);
-                    let _ = rx.wait_for(|v| v.is_some()).await;
-                } else {
-                    drop(entry);
-                }
-
-                if self.mark_branch(&coord, &branch.exclusions) {
-                    return Ok(());
-                }
-
-                if let Some(entry) = self.loaded.get(&coord)
-                    && let CacheEntry::Ready((_, artifact)) = &*entry
-                {
-                    let existing_deps = artifact.dependencies.clone();
-                    let artifact_path = artifact.artifact_path.clone();
-                    drop(entry);
-
-                    self.merge_branch_deps(&coord, &artifact_path, &existing_deps, &branch)
-                        .await?;
-                }
-
-                return Ok(());
-            }
-            dashmap::Entry::Vacant(entry) => {
-                self.mark_branch(&coord, &branch.exclusions);
                 let (tx, rx) = watch::channel(None);
-                entry.insert(CacheEntry::Loading(rx));
+                e.insert(ArtifactSlot {
+                    rank: rank.clone(),
+                    entry: CacheEntry::Loading(rx),
+                });
                 tx
             }
         };
@@ -271,30 +209,36 @@ impl MavenLoader {
 
         let (repo, artifact_path) = self.resolve_coord(&coord).await?;
         let coord_str = coord.to_string();
-        let (repo, pom) = self.fetch_pom(&repo, &artifact_path, Some(&coord_str)).await?;
+        let (repo, pom) = self
+            .fetch_pom(&repo, &artifact_path, Some(&coord_str))
+            .await?;
 
         let repo = repo.context("no repo found")?;
         let source = repo.base().to_string();
 
         let dep_coords = self.resolve_pom_deps(&coord, &pom, &branch).await?;
 
-        let artifact = (
-            Some(repo),
-            Arc::new(ResolvedArtifact {
-                source,
-                coord: coord.clone(),
-                artifact_path: artifact_path.as_ref().clone(),
-                artifact_type: Default::default(),
-                dependencies: dep_coords,
-                depth: branch.depth,
-            }),
-        );
+        let artifact = Arc::new(ResolvedArtifact {
+            source,
+            coord: coord.clone(),
+            artifact_path: artifact_path.as_ref().clone(),
+            artifact_type: Default::default(),
+            dependencies: dep_coords,
+        });
 
         StatusHandle::get().resolved(&coord);
 
-        self.loaded
-            .insert(coord, CacheEntry::Ready(artifact.clone()));
-        let _ = tx.send(Some(artifact));
+        let entry = (Some(repo), artifact);
+        self.artifacts.insert(
+            key,
+            ArtifactSlot {
+                rank,
+                entry: CacheEntry::Ready(entry.clone()),
+            },
+        );
+
+        let _ = tx.send(Some(entry));
+
         Ok(())
     }
 
@@ -327,7 +271,7 @@ impl MavenLoader {
 
         let mut dep_coords = BTreeMap::new();
 
-        for dep in &pom.dependencies {
+        for (i, dep) in pom.dependencies.iter().enumerate() {
             let pom_scope = match dep.scope {
                 DependencyScope::Compile => PomScope::Compile,
                 DependencyScope::Runtime => PomScope::Runtime,
@@ -353,85 +297,75 @@ impl MavenLoader {
 
             dep_coords.insert(coord.clone(), pom_scope);
 
-            let child = branch.child(dep.exclusions.iter().map(|e| e.to_key()));
+            let child = branch.child(i, dep.exclusions.iter().map(|e| e.to_key()));
             self.clone().spawn_load_artifact(coord, child);
         }
 
         Ok(dep_coords)
     }
 
-    async fn merge_branch_deps(
-        self: &Arc<Self>,
-        coord: &ArtifactCoordinates,
-        artifact_path: &Utf8Path,
-        existing_deps: &BTreeMap<ArtifactCoordinates, PomScope>,
-        branch: &LoaderBranch,
-    ) -> anyhow::Result<()> {
-        let (_, pom) = self.fetch_pom(&None, artifact_path, Some(&coord.to_string())).await?;
-        let new_deps = self.resolve_pom_deps(coord, &pom, branch).await?;
-
-        let added: BTreeMap<_, _> = new_deps
-            .into_iter()
-            .filter(|(k, _)| !existing_deps.contains_key(k))
-            .collect();
-        if added.is_empty() {
-            return Ok(());
-        }
-
-        if let Some(mut entry) = self.loaded.get_mut(coord)
-            && let CacheEntry::Ready((_, ref mut artifact)) = *entry
-        {
-            let merged = Arc::make_mut(artifact);
-            merged.dependencies.extend(added);
-        }
-
-        Ok(())
-    }
-
     pub fn spawn_load_artifact(self: Arc<Self>, coord: ArtifactCoordinates, branch: LoaderBranch) {
+        let artifacts = self.artifacts.clone();
+        let rank: Rank = (branch.depth, branch.position.clone());
         tokio::spawn(async move {
-            let _permit = self.semaphore.clone().acquire_owned().await;
             if let Err(e) = self.load_artifact(coord.clone(), branch).await {
-                StatusHandle::get().error(coord, e);
+                StatusHandle::get().end(coord.to_string());
+                let key = coord.key();
+                match artifacts.entry(key) {
+                    dashmap::Entry::Occupied(existing) if existing.get().rank <= rank => {}
+                    dashmap::Entry::Occupied(mut existing) => {
+                        existing.insert(ArtifactSlot {
+                            rank,
+                            entry: CacheEntry::Failed(Arc::new(e)),
+                        });
+                    }
+                    dashmap::Entry::Vacant(vacant) => {
+                        vacant.insert(ArtifactSlot {
+                            rank,
+                            entry: CacheEntry::Failed(Arc::new(e)),
+                        });
+                    }
+                }
             }
         });
     }
 
-    pub async fn into_resolved(self: Arc<Self>) -> ResolvedDependencies {
+    pub async fn into_resolved(self: Arc<Self>) -> anyhow::Result<ResolvedDependencies> {
         let mut rx = self.channel.1.clone();
-        let loaded = self.loaded.clone();
+        let artifacts = self.artifacts.clone();
         drop(self);
 
         let _ = rx.changed().await;
 
-        let mut deduped = HashMap::<_, Arc<ResolvedArtifact>>::new();
-        for entry in loaded.iter() {
-            let val = match entry.value() {
-                CacheEntry::Ready((_, val)) => val.clone(),
-                _ => unreachable!(),
-            };
+        let map = Arc::try_unwrap(artifacts).unwrap_or_else(|arc| (*arc).clone());
 
-            match deduped.entry(entry.key().key()) {
-                hash_map::Entry::Occupied(mut existing) if existing.get().depth < val.depth => {
-                    existing.insert(val);
+        let mut result = Vec::new();
+        let mut slot_map = HashMap::new();
+
+        for (key, slot) in map.into_iter() {
+            match slot.entry {
+                CacheEntry::Ready((repo, artifact)) => {
+                    let repo =
+                        repo.context(format!("resolved artifact {} must have a source repo", key))?;
+                    result.push(artifact.clone());
+                    slot_map.insert(key, (slot.rank, repo, artifact));
                 }
-                hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(val);
-                }
-                _ => {}
+                CacheEntry::Failed(error) => anyhow::bail!("failed to resolve {key}: {error}"),
+                CacheEntry::Loading(_) => continue,
             }
         }
 
-        ResolvedDependencies {
-            artifacts: deduped.into_values().collect(),
-            loaded,
-        }
+        Ok(ResolvedDependencies {
+            artifacts: result,
+            slot_map,
+        })
     }
 }
 
 pub struct ResolvedDependencies {
     pub artifacts: Vec<Arc<ResolvedArtifact>>,
-    loaded: Arc<Cache<ArtifactCoordinates, ResolvedArtifact>>,
+    pub(crate) slot_map:
+        HashMap<ArtifactKey, (Rank, Arc<MavenRepositoryClient>, Arc<ResolvedArtifact>)>,
 }
 
 impl ResolvedDependencies {
@@ -441,16 +375,10 @@ impl ResolvedDependencies {
         ext: &str,
         out: &Utf8Path,
     ) -> anyhow::Result<Vec<u8>> {
-        let entry = self
-            .loaded
-            .get(coord)
-            .expect("coord must be resolved first");
-        let (repo, artifact) = match &*entry {
-            CacheEntry::Ready(val) => val.clone(),
-            _ => unreachable!(),
-        };
-
-        let repo = repo.expect("resolved artifact must have a source repo");
+        let (_, repo, artifact) = self
+            .slot_map
+            .get(&coord.key())
+            .context("coord must be resolved first")?;
         let path = artifact.artifact_path.with_added_extension(ext);
         let key = format!("dl:{coord}");
         let asset = repo
@@ -484,6 +412,7 @@ impl MavenLoader {
         match map.entry(key.clone()) {
             dashmap::Entry::Occupied(entry) => match entry.get() {
                 CacheEntry::Ready(v) => Ok(v.clone()),
+                CacheEntry::Failed(error) => Err(anyhow::anyhow!("{error}")),
                 CacheEntry::Loading(rx) => {
                     let mut rx = rx.clone();
                     drop(entry);
