@@ -8,13 +8,13 @@ use anyhow::Context as _;
 
 use camino::{Utf8Path, Utf8PathBuf};
 use dashmap::DashMap;
-use futures_util::{TryFutureExt, future::join_all};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::watch;
 
 use crate::{
     manifest::{ArtifactType, PomScope, lock::Lock},
     maven::{
-        MAVEN_POM_SUFFIX, MavenRepositoryClient,
+        ClientError, MAVEN_POM_SUFFIX, MavenRepositoryClient,
         pom::{Dependency, DependencyScope, Parent, Pom},
         xml::{XmlFile, XmlNode},
     },
@@ -95,17 +95,21 @@ pub struct MavenLoader {
 }
 
 impl MavenLoader {
-    pub fn new(urls: &[String]) -> Arc<Self> {
+    pub fn new(repos: &[crate::manifest::RepoEntry]) -> Arc<Self> {
         let super_pom = XmlFile::from_str(include_str!("./pom-4.1.0.xml"))
             .expect("built-in super POM is valid");
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .user_agent(format!("borneo/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("failed to build HTTP client");
 
-        let all_repos: Vec<_> = urls
+        let all_repos: Vec<_> = repos
             .iter()
-            .map(|url| {
+            .map(|entry| {
                 Arc::new(MavenRepositoryClient::with_client(
                     client.clone(),
-                    url.clone(),
+                    entry.url.clone(),
+                    entry.checksum_policy,
                 ))
             })
             .collect();
@@ -134,25 +138,98 @@ impl MavenLoader {
             return;
         }
 
+        let by_coord: HashMap<_, _> = lock.artifacts.iter().map(|a| (&a.coord, a)).collect();
+
+        let manifest_coords: BTreeSet<_> = deps.iter().filter_map(|d| d.coord()).collect();
+
+        let mut invalidated_keys = BTreeSet::new();
+
+        for la in &lock.artifacts {
+            if la.depth == 0 && !manifest_coords.contains(&la.coord) {
+                invalidated_keys.insert(la.coord.key());
+            }
+        }
+
         for dep in deps {
             let Some(coord) = dep.coord() else { continue };
-            let Some(lock_artifact) = lock.artifacts.iter().find(|a| a.coord == *coord) else {
+            let lock_match = by_coord.get(coord);
+            let changed = match lock_match {
+                None => true,
+                Some(la) => la.exclusions != dep.exclusions,
+            };
+            if changed {
+                invalidated_keys.insert(coord.key());
+            }
+        }
+
+        if !invalidated_keys.is_empty() {
+            let mut reverse_deps: HashMap<ArtifactKey, Vec<ArtifactKey>> = HashMap::new();
+            for la in &lock.artifacts {
+                for dep_coord in la.dependencies.keys() {
+                    reverse_deps
+                        .entry(dep_coord.key())
+                        .or_default()
+                        .push(la.coord.key());
+                }
+            }
+
+            let mut queue = std::collections::VecDeque::from_iter(invalidated_keys.iter().cloned());
+            while let Some(key) = queue.pop_front() {
+                if let Some(dependents) = reverse_deps.get(&key) {
+                    for dep_key in dependents {
+                        if invalidated_keys.insert(dep_key.clone()) {
+                            queue.push_back(dep_key.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut reachable = BTreeSet::new();
+        let mut queue = std::collections::VecDeque::new();
+
+        for dep in deps {
+            let Some(coord) = dep.coord() else { continue };
+            if invalidated_keys.contains(&coord.key()) {
+                continue;
+            }
+            let Some(lock_artifact) = by_coord.get(coord) else {
                 continue;
             };
             if lock_artifact.exclusions != dep.exclusions {
-                return;
+                continue;
+            }
+            queue.push_back(coord.clone());
+        }
+
+        while let Some(coord) = queue.pop_front() {
+            if !reachable.insert(coord.clone()) {
+                continue;
+            }
+            if invalidated_keys.contains(&coord.key()) {
+                continue;
+            }
+            if let Some(lock_artifact) = by_coord.get(&coord) {
+                for dep_coord in lock_artifact.dependencies.keys() {
+                    queue.push_back(dep_coord.clone());
+                }
             }
         }
 
         let mut repos = HashMap::new();
 
-        for lock_artifact in &lock.artifacts {
+        for lock_artifact in lock
+            .artifacts
+            .iter()
+            .filter(|a| reachable.contains(&a.coord))
+        {
             let repo = repos
                 .entry(lock_artifact.source.clone())
                 .or_insert_with(|| {
                     Arc::new(MavenRepositoryClient::with_client(
                         self.client.clone(),
                         lock_artifact.source.clone(),
+                        Default::default(),
                     ))
                 })
                 .clone();
@@ -311,18 +388,21 @@ impl MavenLoader {
             if let Err(e) = self.load_artifact(coord.clone(), branch).await {
                 StatusHandle::get().end(coord.to_string());
                 let key = coord.key();
+                let err = Arc::new(e);
                 match artifacts.entry(key) {
-                    dashmap::Entry::Occupied(existing) if existing.get().rank <= rank => {}
+                    dashmap::Entry::Occupied(existing)
+                        if matches!(existing.get().entry, CacheEntry::Ready(_))
+                            && existing.get().rank <= rank => {}
                     dashmap::Entry::Occupied(mut existing) => {
                         existing.insert(ArtifactSlot {
                             rank,
-                            entry: CacheEntry::Failed(Arc::new(e)),
+                            entry: CacheEntry::Failed(err),
                         });
                     }
                     dashmap::Entry::Vacant(vacant) => {
                         vacant.insert(ArtifactSlot {
                             rank,
-                            entry: CacheEntry::Failed(Arc::new(e)),
+                            entry: CacheEntry::Failed(err),
                         });
                     }
                 }
@@ -446,21 +526,21 @@ impl MavenLoader {
                     let version =
                         ArtifactVersion::new(version).expect("stripped version cannot contain ':'");
 
-                    let futs = self.repos.iter().map(|repo| {
-                        repo.artifact_metadata(
-                            coord.group_id(),
-                            coord.artifact_id(),
-                            Some(coord.version()),
-                        )
-                        .map_ok(|meta| (repo.clone(), meta))
-                    });
-                    let mut results = join_all(futs).await;
-                    results.sort_unstable_by_key(Result::is_ok);
-
-                    let (repo, meta) = results
-                        .pop()
-                        .context("no repository responded")?
-                        .with_context(|| format!("failed to resolve metadata for {coord}"))?;
+                    let (repo, meta) = race_repos(&self.repos, |repo| {
+                        let repo = repo.clone();
+                        async move {
+                            let meta = repo
+                                .artifact_metadata(
+                                    coord.group_id(),
+                                    coord.artifact_id(),
+                                    Some(coord.version()),
+                                )
+                                .await?;
+                            Ok::<_, ClientError>((repo, meta))
+                        }
+                    })
+                    .await
+                    .with_context(|| format!("failed to resolve metadata for {coord}"))?;
 
                     let snapshot = meta
                         .versioning
@@ -503,23 +583,29 @@ impl MavenLoader {
         self.get_or_load(&self.files, path.to_string(), async {
             let path = path.with_added_extension(MAVEN_POM_SUFFIX);
 
-            let mut results = if let Some(hint) = repo_hint {
+            let results = if let Some(hint) = repo_hint {
                 vec![
                     hint.fetch_xml(path.as_str(), status_key)
                         .await
                         .map(|res| (hint.clone(), res)),
                 ]
             } else {
-                join_all(self.repos.iter().map(|repo| {
-                    repo.fetch_xml(path.as_str(), status_key)
-                        .map_ok(|res| (repo.clone(), res))
-                }))
-                .await
+                vec![
+                    race_repos(&self.repos, |repo| {
+                        let repo = repo.clone();
+                        let path = path.clone();
+                        async move {
+                            let res = repo.fetch_xml(path.as_str(), status_key).await?;
+                            Ok((repo, res))
+                        }
+                    })
+                    .await,
+                ]
             };
-            results.sort_unstable_by_key(Result::is_ok);
 
             let (repo, mut xml) = results
-                .pop()
+                .into_iter()
+                .find(|r| r.is_ok())
                 .context("no repositories configured")?
                 .with_context(|| format!("failed to fetch POM {path}"))?;
             xml.replace_templates(&Default::default());
@@ -575,5 +661,52 @@ impl MavenLoader {
             Ok((Some(repo), Arc::new(xml)))
         })
         .await
+    }
+}
+
+async fn race_repos<T, E, F, Fut>(repos: &[Arc<MavenRepositoryClient>], f: F) -> Result<T, E>
+where
+    F: Fn(&Arc<MavenRepositoryClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let n = repos.len();
+    let mut futs: FuturesUnordered<_> = repos
+        .iter()
+        .enumerate()
+        .map(|(i, repo)| {
+            let fut = f(repo);
+            async move { (i, fut.await) }
+        })
+        .collect();
+
+    let mut best_ok: Option<(usize, Result<T, E>)> = None;
+    let mut last_err: Option<Result<T, E>> = None;
+    let mut seen = vec![false; n];
+
+    while let Some((i, result)) = futs.next().await {
+        seen[i] = true;
+
+        if result.is_ok() {
+            match &best_ok {
+                Some((best_i, _)) if *best_i <= i => {}
+                _ => best_ok = Some((i, result)),
+            }
+        } else {
+            last_err = Some(result);
+        }
+
+        if let Some((best_i, _)) = &best_ok
+            && seen[0..=*best_i].iter().all(|s| *s)
+        {
+            break;
+        }
+    }
+
+    if let Some((_, result)) = best_ok {
+        result
+    } else if let Some(err) = last_err {
+        err
+    } else {
+        panic!("no repositories configured")
     }
 }

@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use indexmap::IndexSet;
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use miette::{LabeledSpan, NamedSource};
 
@@ -73,28 +72,37 @@ pub struct BuildConfig {
     pub post_build: Option<String>,
 }
 
-pub struct Repositories {
-    pub central: bool,
-    pub extra: IndexSet<String>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChecksumPolicy {
+    #[default]
+    Fail,
+    Warn,
+    Ignore,
 }
+
+pub struct RepoEntry {
+    pub url: String,
+    pub checksum_policy: ChecksumPolicy,
+}
+
+pub struct Repositories(pub Vec<RepoEntry>);
 
 impl Default for Repositories {
     fn default() -> Self {
-        Self {
-            central: true,
-            extra: IndexSet::new(),
-        }
+        Self(vec![RepoEntry {
+            url: crate::maven::MAVEN_REPO.to_string(),
+            checksum_policy: ChecksumPolicy::Fail,
+        }])
     }
 }
 
 impl Repositories {
+    pub fn entries(&self) -> &[RepoEntry] {
+        &self.0
+    }
+
     pub fn urls(&self) -> Vec<String> {
-        let mut urls = Vec::new();
-        if self.central {
-            urls.push(crate::maven::MAVEN_REPO.to_string());
-        }
-        urls.extend(self.extra.iter().cloned());
-        urls
+        self.0.iter().map(|e| e.url.clone()).collect()
     }
 }
 
@@ -341,6 +349,20 @@ fn parse_kdl_bool(val: &KdlValue) -> Option<bool> {
     }
 }
 
+fn parse_checksum_policy(node: &KdlNode) -> ChecksumPolicy {
+    node.entry("checksum-policy")
+        .and_then(|e| match e.value() {
+            KdlValue::String(s) => match s.as_str() {
+                "fail" => Some(ChecksumPolicy::Fail),
+                "warn" => Some(ChecksumPolicy::Warn),
+                "ignore" => Some(ChecksumPolicy::Ignore),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 fn parse_repositories(doc: &KdlDocument) -> Repositories {
     let Some(node) = doc.get("repositories") else {
         return Repositories::default();
@@ -349,7 +371,8 @@ fn parse_repositories(doc: &KdlDocument) -> Repositories {
         return Repositories::default();
     };
 
-    let mut repos = Repositories::default();
+    let mut entries = Vec::new();
+    let mut has_central = false;
     for node in children.nodes() {
         let enabled = node
             .entry("enabled")
@@ -357,12 +380,32 @@ fn parse_repositories(doc: &KdlDocument) -> Repositories {
             .unwrap_or(true);
 
         if node.name().value() == "central" {
-            repos.central = enabled;
+            has_central = true;
+            if enabled {
+                entries.push(RepoEntry {
+                    url: crate::maven::MAVEN_REPO.to_string(),
+                    checksum_policy: parse_checksum_policy(node),
+                });
+            }
         } else if enabled {
-            repos.extra.insert(node.name().value().to_string());
+            entries.push(RepoEntry {
+                url: node.name().value().to_string(),
+                checksum_policy: parse_checksum_policy(node),
+            });
         }
     }
-    repos
+
+    if !has_central {
+        entries.insert(
+            0,
+            RepoEntry {
+                url: crate::maven::MAVEN_REPO.to_string(),
+                checksum_policy: ChecksumPolicy::Fail,
+            },
+        );
+    }
+
+    Repositories(entries)
 }
 
 fn parse_test_config(doc: &KdlDocument) -> TestConfig {

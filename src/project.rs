@@ -358,7 +358,10 @@ impl Project {
         }
     }
 
-    pub fn clean(&self) -> Result<()> {
+    pub fn clean(&self, purge: bool) -> Result<()> {
+        if purge {
+            return self.purge_cache();
+        }
         if self.out.exists() {
             std::fs::remove_dir_all(&self.out).with_context(|| {
                 format!("failed to remove build directory: {}", self.out.display())
@@ -370,6 +373,50 @@ impl Project {
                     .unwrap_or(&self.out)
                     .display()
             );
+        }
+        Ok(())
+    }
+
+    fn purge_cache(&self) -> Result<()> {
+        let cache_dir = self.dir.join("build").join("cache");
+        if !cache_dir.is_dir() {
+            return Ok(());
+        }
+
+        let lock_path = self.dir.join("borneo.lock");
+        let lock = read_lock(&lock_path)?;
+
+        let locked_files: BTreeSet<String> = lock
+            .as_ref()
+            .map(|l| {
+                l.artifacts
+                    .iter()
+                    .map(|a| {
+                        let ext = a.artifact_type.extension();
+                        format!(
+                            "{}-{}-{}.{ext}",
+                            a.coord.group_id().as_str(),
+                            a.coord.artifact_id().as_str(),
+                            a.coord.version().as_str(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&cache_dir).context("failed to read cache directory")? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !locked_files.contains(name.as_ref()) {
+                std::fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+
+        if removed > 0 {
+            eprintln!("purged {removed} stale artifacts from cache");
         }
         Ok(())
     }
@@ -521,8 +568,9 @@ impl Project {
             }
         }
 
+        let repo_entries = manifest.repositories.entries();
         let repo_urls = manifest.repositories.urls();
-        let resolved = resolve_artifacts(manifest, &prev_lock, &repo_urls).await?;
+        let resolved = resolve_artifacts(manifest, &prev_lock, repo_entries, &repo_urls).await?;
         let mut lock = download_and_lock(
             &mut self.class_path,
             manifest,
@@ -542,9 +590,10 @@ impl Project {
 async fn resolve_artifacts(
     manifest: &manifest::Manifest,
     prev_lock: &Option<Lock>,
+    repo_entries: &[manifest::RepoEntry],
     repo_urls: &[String],
 ) -> Result<ResolvedDependencies> {
-    let loader = MavenLoader::new(repo_urls);
+    let loader = MavenLoader::new(repo_entries);
 
     if let Some(lock) = prev_lock {
         loader.seed_from_lock(lock, &manifest.dependencies, repo_urls);
@@ -787,8 +836,27 @@ fn copy_dir_contents(src: &Path, dst: &Path) -> Result<()> {
 }
 
 fn unpack_jar(java: &crate::java::Java, jar: &Path, dst: &Path) -> Result<()> {
-    java.extract_jar(jar, dst)
+    let tmp = dst.join(".shadow-tmp");
+    if tmp.exists() {
+        std::fs::remove_dir_all(&tmp)?;
+    }
+    std::fs::create_dir_all(&tmp)?;
+
+    java.extract_jar(jar, &tmp)
         .with_context(|| format!("failed to unpack {}", jar.display()))?;
+
+    for entry in walkdir::WalkDir::new(&tmp) {
+        let entry = entry?;
+        let rel = entry.path().strip_prefix(&tmp).unwrap();
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+        } else if !target.exists() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+
+    std::fs::remove_dir_all(&tmp)?;
     Ok(())
 }
 

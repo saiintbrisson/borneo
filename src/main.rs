@@ -73,7 +73,7 @@ async fn run(cli: Cli) -> Result<()> {
             project.test(&cmd).await?;
         }
         Commands::Clean(cmd) => {
-            project::Project::from_project_args(&cmd.project_args)?.clean()?;
+            project::Project::from_project_args(&cmd.project_args)?.clean(cmd.purge)?;
         }
     }
 

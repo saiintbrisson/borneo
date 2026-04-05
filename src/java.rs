@@ -78,14 +78,14 @@ impl Java {
         let class_path = class_path.join(&OsString::from(PATH_SEPARATOR));
 
         if !class_path.is_empty() {
-            cmd.arg("--class-path").arg(class_path);
+            cmd.arg("-cp").arg(class_path);
         }
 
         let proc_path: Vec<_> = processor_path.map(|p| p.as_os_str()).collect();
         let proc_path = proc_path.join(&OsString::from(PATH_SEPARATOR));
 
         if !proc_path.is_empty() {
-            cmd.arg("--processor-path").arg(proc_path);
+            cmd.arg("-processorpath").arg(proc_path);
         }
 
         cmd.args(extra_args);
@@ -144,7 +144,7 @@ impl Java {
             final_class_path.push(class_path);
         }
 
-        cmd.arg("--class-path").arg(final_class_path);
+        cmd.arg("-cp").arg(final_class_path);
         cmd.arg(entry);
         cmd.args(args);
         run_cmd(&mut cmd, "java")

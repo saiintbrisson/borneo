@@ -1,4 +1,4 @@
-use std::future::ready;
+use std::{future::ready, time::Duration};
 
 use camino::Utf8Path;
 use futures_util::{StreamExt, TryFutureExt, future::join, stream::FuturesOrdered};
@@ -11,6 +11,7 @@ pub mod xml;
 use reqwest::header::CONTENT_TYPE;
 
 use crate::{
+    manifest::ChecksumPolicy,
     maven::xml::XmlFile,
     types::{ArtifactId, ArtifactVersion, GroupId},
 };
@@ -19,10 +20,11 @@ pub const MAVEN_REPO: &str = "https://repo1.maven.org/maven2";
 pub const MAVEN_METADATA_FILE: &str = "maven-metadata.xml";
 pub const MAVEN_POM_SUFFIX: &str = "pom";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MavenRepositoryClient {
     client: reqwest::Client,
     base: String,
+    checksum_policy: ChecksumPolicy,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -70,8 +72,21 @@ pub struct Content {
 }
 
 impl MavenRepositoryClient {
-    pub fn with_client(client: reqwest::Client, base: String) -> Self {
-        Self { client, base }
+    pub fn with_client(
+        client: reqwest::Client,
+        base: String,
+        checksum_policy: ChecksumPolicy,
+    ) -> Self {
+        let mut base = base;
+        if !base.starts_with("http://") && !base.starts_with("https://") {
+            base = format!("https://{base}");
+        }
+        let base = base.trim_end_matches('/').to_string();
+        Self {
+            client,
+            base,
+            checksum_policy,
+        }
     }
 
     pub fn base(&self) -> &str {
@@ -112,34 +127,20 @@ impl MavenRepositoryClient {
         aid: &ArtifactId,
         version: Option<&ArtifactVersion>,
     ) -> Result<metadata::ArtifactMetadata, ClientError> {
-        let resp = self
-            .client
-            .get(format!(
-                "{}/{}/{}/{}{MAVEN_METADATA_FILE}",
-                self.base,
-                gid.to_path(),
-                aid.as_str(),
-                if let Some(version) = version {
-                    format!("{}/", version.as_str())
-                } else {
-                    String::new()
-                }
-            ))
-            .send()
-            .await?
-            .error_for_status()?;
-        let ty = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .ok_or_else(|| ClientError::MissingHeader(CONTENT_TYPE))?;
-        if !matches!(ty.as_bytes(), b"text/xml" | b"application/xml") {
-            return Err(ClientError::InvalidContentType(
-                "text/xml or application/xml".to_string(),
-                ty.clone(),
-            ));
-        }
+        let path = format!(
+            "{}/{}/{}{MAVEN_METADATA_FILE}",
+            gid.to_path(),
+            aid.as_str(),
+            if let Some(version) = version {
+                format!("{}/", version.as_str())
+            } else {
+                String::new()
+            }
+        );
 
-        let txt = resp.text().await?;
+        let content = self.execute_request(&path, &[], None).await?;
+        let txt = String::from_utf8(content.content.to_vec())
+            .map_err(|e| ClientError::ParseError(e.to_string()))?;
 
         quick_xml::de::from_str(&txt).map_err(|e| ClientError::ParseError(e.to_string()))
     }
@@ -154,17 +155,17 @@ impl MavenRepositoryClient {
 
         let attempt = AtomicU32::new(0);
         let backoff = backoff::ExponentialBackoffBuilder::new()
-            .with_initial_interval(std::time::Duration::from_millis(200))
+            .with_initial_interval(Duration::from_millis(200))
             .with_multiplier(3.0)
-            .with_max_elapsed_time(Some(std::time::Duration::from_secs(30)))
+            .with_max_elapsed_time(Some(Duration::from_secs(30)))
             .build();
 
         backoff::future::retry(backoff, || async {
             let n = attempt.fetch_add(1, Ordering::Relaxed);
             let timeout = match n {
-                0 => std::time::Duration::from_secs(5),
-                1 => std::time::Duration::from_secs(10),
-                _ => std::time::Duration::from_secs(20),
+                0 => Duration::from_secs(5),
+                1 => Duration::from_secs(10),
+                _ => Duration::from_secs(20),
             };
 
             self.try_execute_request(path, accepted_mimes, timeout)
@@ -187,7 +188,7 @@ impl MavenRepositoryClient {
         &self,
         path: &str,
         accepted_mimes: &'static [&[u8]],
-        timeout: std::time::Duration,
+        timeout: Duration,
     ) -> Result<Content, ClientError> {
         let url = format!("{}/{path}", self.base);
         let req = self
@@ -219,10 +220,18 @@ impl MavenRepositoryClient {
             digest => {
                 let digest = digest?;
                 let name = digest.name;
-                digest
-                    .check(&content)
-                    .map_err(|_| ClientError::ChecksumFailed(url.clone(), name))?;
-                Ok(Content { content })
+                match digest.check(&content) {
+                    Ok(_) => Ok(Content { content }),
+                    Err(_) => match self.checksum_policy {
+                        ChecksumPolicy::Fail => Err(ClientError::ChecksumFailed(url, name)),
+                        ChecksumPolicy::Warn => {
+                            crate::status::StatusHandle::get()
+                                .log(format!("checksum mismatch for {url} ({name}), ignoring"));
+                            Ok(Content { content })
+                        }
+                        ChecksumPolicy::Ignore => Ok(Content { content }),
+                    },
+                }
             }
         }
     }
@@ -232,15 +241,7 @@ impl MavenRepositoryClient {
         path: &str,
         status_key: Option<&str>,
     ) -> Result<XmlFile, ClientError> {
-        const ACCEPTED_MIMES: &[&[u8]] = &[
-            b"text/xml",
-            b"application/xml",
-            b"application/x-maven-pom+xml",
-        ];
-
-        let content = self
-            .execute_request(path, ACCEPTED_MIMES, status_key)
-            .await?;
+        let content = self.execute_request(path, &[], status_key).await?;
         let txt = String::from_utf8(content.content.to_vec())
             .map_err(|e| ClientError::ParseError(e.to_string()))?;
 

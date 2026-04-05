@@ -56,6 +56,10 @@ pub struct BuildCommand {
 pub struct CleanCommand {
     #[command(flatten)]
     pub project_args: ProjectArgs,
+
+    /// Remove cached artifacts not in the current lock
+    #[arg(long)]
+    pub purge: bool,
 }
 
 #[derive(clap::Args)]
