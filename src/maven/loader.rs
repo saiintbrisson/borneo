@@ -86,6 +86,7 @@ pub struct MavenLoader {
     super_pom: XmlFile,
     client: reqwest::Client,
     repos: Vec<Arc<MavenRepositoryClient>>,
+    strategy: crate::manifest::RepoStrategy,
 
     channel: (watch::Sender<Option<()>>, watch::Receiver<Option<()>>),
     artifacts: Arc<DashMap<ArtifactKey, ArtifactSlot>>,
@@ -95,7 +96,7 @@ pub struct MavenLoader {
 }
 
 impl MavenLoader {
-    pub fn new(repos: &[crate::manifest::RepoEntry]) -> Arc<Self> {
+    pub fn new(repos: &[crate::manifest::RepoEntry], strategy: crate::manifest::RepoStrategy) -> Arc<Self> {
         let super_pom = XmlFile::from_str(include_str!("./pom-4.1.0.xml"))
             .expect("built-in super POM is valid");
         let client = reqwest::Client::builder()
@@ -118,6 +119,7 @@ impl MavenLoader {
             super_pom,
             repos: all_repos,
             client,
+            strategy,
 
             channel: watch::channel(None),
             artifacts: Default::default(),
@@ -526,7 +528,7 @@ impl MavenLoader {
                     let version =
                         ArtifactVersion::new(version).expect("stripped version cannot contain ':'");
 
-                    let (repo, meta) = race_repos(&self.repos, |repo| {
+                    let (repo, meta) = search_repos(&self.repos, self.strategy, |repo| {
                         let repo = repo.clone();
                         async move {
                             let meta = repo
@@ -591,7 +593,7 @@ impl MavenLoader {
                 ]
             } else {
                 vec![
-                    race_repos(&self.repos, |repo| {
+                    search_repos(&self.repos, self.strategy, |repo| {
                         let repo = repo.clone();
                         let path = path.clone();
                         async move {
@@ -708,5 +710,35 @@ where
         err
     } else {
         panic!("no repositories configured")
+    }
+}
+
+async fn sequential_repos<T, E, F, Fut>(repos: &[Arc<MavenRepositoryClient>], f: F) -> Result<T, E>
+where
+    F: Fn(&Arc<MavenRepositoryClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let mut last_err = None;
+    for repo in repos {
+        match f(repo).await {
+            Ok(val) => return Ok(val),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.expect("no repositories configured"))
+}
+
+async fn search_repos<T, E, F, Fut>(
+    repos: &[Arc<MavenRepositoryClient>],
+    strategy: crate::manifest::RepoStrategy,
+    f: F,
+) -> Result<T, E>
+where
+    F: Fn(&Arc<MavenRepositoryClient>) -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    match strategy {
+        crate::manifest::RepoStrategy::Race => race_repos(repos, f).await,
+        crate::manifest::RepoStrategy::Sequential => sequential_repos(repos, f).await,
     }
 }

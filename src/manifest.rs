@@ -75,6 +75,7 @@ pub struct BuildConfig {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ChecksumPolicy {
+    Required,
     #[default]
     Fail,
     Warn,
@@ -86,24 +87,37 @@ pub struct RepoEntry {
     pub checksum_policy: ChecksumPolicy,
 }
 
-pub struct Repositories(pub Vec<RepoEntry>);
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RepoStrategy {
+    #[default]
+    Race,
+    Sequential,
+}
+
+pub struct Repositories {
+    pub entries: Vec<RepoEntry>,
+    pub strategy: RepoStrategy,
+}
 
 impl Default for Repositories {
     fn default() -> Self {
-        Self(vec![RepoEntry {
-            url: crate::maven::MAVEN_REPO.to_string(),
-            checksum_policy: ChecksumPolicy::Fail,
-        }])
+        Self {
+            entries: vec![RepoEntry {
+                url: crate::maven::MAVEN_REPO.to_string(),
+                checksum_policy: ChecksumPolicy::Fail,
+            }],
+            strategy: RepoStrategy::default(),
+        }
     }
 }
 
 impl Repositories {
     pub fn entries(&self) -> &[RepoEntry] {
-        &self.0
+        &self.entries
     }
 
     pub fn urls(&self) -> Vec<String> {
-        self.0.iter().map(|e| e.url.clone()).collect()
+        self.entries.iter().map(|e| e.url.clone()).collect()
     }
 }
 
@@ -354,6 +368,7 @@ fn parse_checksum_policy(node: &KdlNode) -> ChecksumPolicy {
     node.entry("checksum-policy")
         .and_then(|e| match e.value() {
             KdlValue::String(s) => match s.as_str() {
+                "required" => Some(ChecksumPolicy::Required),
                 "fail" => Some(ChecksumPolicy::Fail),
                 "warn" => Some(ChecksumPolicy::Warn),
                 "ignore" => Some(ChecksumPolicy::Ignore),
@@ -371,6 +386,18 @@ fn parse_repositories(doc: &KdlDocument) -> Repositories {
     let Some(children) = node.children() else {
         return Repositories::default();
     };
+
+    let strategy = node
+        .entry("strategy")
+        .and_then(|e| match e.value() {
+            KdlValue::String(s) => match s.as_str() {
+                "race" => Some(RepoStrategy::Race),
+                "sequential" => Some(RepoStrategy::Sequential),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or_default();
 
     let mut entries = Vec::new();
     let mut has_central = false;
@@ -406,7 +433,7 @@ fn parse_repositories(doc: &KdlDocument) -> Repositories {
         );
     }
 
-    Repositories(entries)
+    Repositories { entries, strategy }
 }
 
 fn parse_test_config(doc: &KdlDocument) -> TestConfig {
@@ -425,7 +452,7 @@ fn parse_test_config(doc: &KdlDocument) -> TestConfig {
         .children()
         .into_iter()
         .flat_map(|c| c.nodes().iter().filter(|n| n.name().value() == "jvm-args"))
-        .filter_map(|n| n.entry(0))
+        .flat_map(|n| n.entries())
         .filter_map(|e| match e.value() {
             KdlValue::String(s) => Some(s.clone()),
             _ => None,
@@ -468,7 +495,7 @@ fn parse_java_config(doc: &KdlDocument, src: &NamedSource<String>) -> miette::Re
         .nodes()
         .iter()
         .filter(|n| n.name().value() == "compiler-args")
-        .filter_map(|n| n.entry(0))
+        .flat_map(|n| n.entries())
         .filter_map(|e| match e.value() {
             KdlValue::String(s) => Some(s.clone()),
             _ => None,

@@ -159,6 +159,7 @@ impl Java {
         &self,
         base: &Path,
         standalone_jar: &Path,
+        standalone_major: u32,
         class_path: impl Iterator<Item = &'a PathBuf>,
         scan_path: &Path,
         jvm_args: &[String],
@@ -170,7 +171,9 @@ impl Java {
         cmd.args(jvm_args);
         cmd.arg("-jar").arg(standalone_jar);
 
-        cmd.arg("execute");
+        if standalone_major >= 6 {
+            cmd.arg("execute");
+        }
 
         let cp: Vec<_> = class_path.map(|p| p.as_os_str()).collect();
         let cp = cp.join(&OsString::from(PATH_SEPARATOR));

@@ -252,12 +252,18 @@ impl Project {
 
                 let slim_jar = self.build_dir.join(format!("{base_name}.jar"));
 
+                let resolve_out = |default_name: String| -> PathBuf {
+                    match &self.out {
+                        Some(o) if o.extension().is_some_and(|ext| ext == "jar") => o.clone(),
+                        Some(o) => o.join(default_name),
+                        None => self.build_dir.join(default_name),
+                    }
+                };
+
                 let final_jar = if shadow {
-                    self.out
-                        .clone()
-                        .unwrap_or_else(|| self.build_dir.join(format!("{base_name}-all.jar")))
+                    resolve_out(format!("{base_name}-all.jar"))
                 } else {
-                    self.out.clone().unwrap_or_else(|| slim_jar.clone())
+                    resolve_out(format!("{base_name}.jar"))
                 };
 
                 let status = status::StatusHandle::get();
@@ -422,6 +428,9 @@ impl Project {
         let (java, classes_dir) = self.compile_main().await?;
         let manifest = self.manifest.as_ref().unwrap();
 
+        const STANDALONE_PREFIX: &str =
+            "org.junit.platform-junit-platform-console-standalone-";
+
         let standalone_jar = self
             .class_path
             .iter()
@@ -430,14 +439,20 @@ impl Project {
                     && path
                         .file_name()
                         .and_then(|f| f.to_str())
-                        .is_some_and(|f| {
-                            f.starts_with("org.junit.platform-junit-platform-console-standalone-")
-                        })
+                        .is_some_and(|f| f.starts_with(STANDALONE_PREFIX))
             })
             .map(|(path, _)| path.clone())
             .context(
                 "test requires org.junit.platform:junit-platform-console-standalone as a test dependency",
             )?;
+
+        let standalone_major: u32 = standalone_jar
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix(STANDALONE_PREFIX))
+            .and_then(|v| v.split('.').next())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
 
         let test_classes_dir = self.build_dir.join("test-classes");
         if test_classes_dir.exists() {
@@ -520,6 +535,7 @@ impl Project {
         java.run_tests(
             &self.dir,
             &standalone_jar,
+            standalone_major,
             run_cp.iter(),
             &test_classes_dir,
             &manifest.test.jvm_args,
@@ -562,7 +578,9 @@ impl Project {
 
         let repo_entries = manifest.repositories.entries();
         let repo_urls = manifest.repositories.urls();
-        let resolved = resolve_artifacts(manifest, &prev_lock, repo_entries, &repo_urls).await?;
+        let strategy = manifest.repositories.strategy;
+        let resolved =
+            resolve_artifacts(manifest, &prev_lock, repo_entries, &repo_urls, strategy).await?;
         let mut lock = download_and_lock(
             &mut self.class_path,
             manifest,
@@ -584,8 +602,9 @@ async fn resolve_artifacts(
     prev_lock: &Option<Lock>,
     repo_entries: &[manifest::RepoEntry],
     repo_urls: &[String],
+    strategy: manifest::RepoStrategy,
 ) -> Result<ResolvedDependencies> {
-    let loader = MavenLoader::new(repo_entries);
+    let loader = MavenLoader::new(repo_entries, strategy);
 
     if let Some(lock) = prev_lock {
         loader.seed_from_lock(lock, &manifest.dependencies, repo_urls);

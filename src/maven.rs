@@ -216,14 +216,19 @@ impl MavenRepositoryClient {
         let content = resp.bytes().await?;
 
         match digest {
-            Err(ClientError::ChecksumNotFound(_)) => Ok(Content { content }),
+            Err(ClientError::ChecksumNotFound(name)) => match self.checksum_policy {
+                ChecksumPolicy::Required => Err(ClientError::ChecksumNotFound(name)),
+                _ => Ok(Content { content }),
+            },
             digest => {
                 let digest = digest?;
                 let name = digest.name;
                 match digest.check(&content) {
                     Ok(_) => Ok(Content { content }),
                     Err(_) => match self.checksum_policy {
-                        ChecksumPolicy::Fail => Err(ClientError::ChecksumFailed(url, name)),
+                        ChecksumPolicy::Required | ChecksumPolicy::Fail => {
+                            Err(ClientError::ChecksumFailed(url, name))
+                        }
                         ChecksumPolicy::Warn => {
                             crate::status::StatusHandle::get()
                                 .log(format!("checksum mismatch for {url} ({name}), ignoring"));

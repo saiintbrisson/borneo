@@ -1,12 +1,10 @@
 # Borneo
 
-Borneo is a compact Java build tool, inspired by Cargo, made to suit simple projects. It uses a KDL-based configuration file for declaring Maven repositories and dependencies, and a lockfile that tracks dependency resolution, allowing subsequent runs to skip network access entirely. It supports Maven repositories, POMs and BOMs, string templates, property, dependency inheritance and exclusions. It supports shadowing by default, but no relocation support as of now.
-
-Downloaded dependencies reside in a project-local directory: `./build/cache`. In contrast to Maven and Gradle, Borneo does not maintain a global repository, and discards all POM files. The lockfile is the single source of truth for transitive dependencies.
+Borneo is a compact Java build tool, inspired by Cargo, made to suit simple projects. It's designed to be modern and slim. It supports Maven repositories and dependencies, maintains a per-project a lockfile and dependency cache. Borneo does not maintain a global repository, XML files are discarded after the lockfile is computed.
 
 ## Getting started
 
-You must have Rust installed, currently on 1.94.0.
+You must have Rust installed, 1.94.0+.
 
 ```bash
 $ cargo install --git https://github.com/saiintbrisson/borneo
@@ -14,9 +12,13 @@ $ borneo -V
 borneo 0.1.0
 ```
 
-### The manifest file
+Use `borneo -h` to get familiar with the commands it provides. You won't need much more than `borneo run`, `borneo build`, or `borneo test`.
 
-Borneo uses [KDL](https://kdl.dev/) for its config file, located in the project's root, called `borneo.kdl`. Every project needs a group ID, artifact ID and a version:
+The `borneo clean` and `borneo clean --purge` commands are also available. The former cleans the entire build directory, while the latter purges all unused dependencies from the cache directory.
+
+## The manifest file
+
+Borneo uses [KDL](https://kdl.dev/) for its config file, located in the project's root, called `borneo.kdl`, conveniently similar to Gradle's build scripts. Every project requires a group ID, artifact ID and a version, all other fields are optional:
 
 ```kdl
 group "com.example"
@@ -36,7 +38,7 @@ packaged build/my-app-1.0.0.jar
 Hello, World!
 ```
 
-By default, source and resources are located in `src/main/java` and `src/main/resources`, but can be overriden in the manifest:
+By default, source and resources are located in `src/main/java` and `src/main/resources`, but can be overridden in the manifest:
 
 ```kdl
 group "com.example"
@@ -47,9 +49,9 @@ source "src/"
 resources "assets/"
 ```
 
-#### Repositories and dependencies
+### Repositories and dependencies
 
-The `dependencies` node allows declaring artifacts to be searched in the Maven repositories. By default, only Maven Central is enabled.
+The `dependencies` node allows declaring artifacts to be searched in the repositories.
 
 ```kdl
 group "com.example"
@@ -67,13 +69,23 @@ dependencies {
     runtime "org.slf4j:slf4j-simple:2.0.16"
     provided "org.apache.logging.log4j:log4j-api:2.24.1"
 
+    processor "org.projectlombok:lombok:1.18.44"
+
     compile path="libs/my-custom.jar"
 }
 ```
 
-A dependency declaration is composed of its scope (as of now, only `compile`, `provided`, and `runtime` are supported), an artifact ID (or coordinates, G:A:V triple), and optionally children `exclude` nodes in `G:A` format. Dependencies can also be sources from local files using the `path` property: `compile path="path/to/jar"`.
+A dependency declaration is composed of its scope, an artifact ID (or coordinates, G:A:V triple), and optionally children `exclude` nodes in `G:A` format. Dependencies can also be sourced from local files using the `path` property: `compile path="path/to/jar"`. The following scopes are available:
 
-Like the former, repositories have their own node as well and it can be used to add new sources as well as disabling the central repo:
+| scope       | compile classpath         | bundled in shadow | notes                                  |
+|-------------|---------------------------|-------------------|----------------------------------------|
+| `compile`   | yes                       | yes               | the default scope                      |
+| `runtime`   | no                        | yes               | tvailable at runtime only              |
+| `provided`  | yes                       | no                | supplied by the runtime environment    |
+| `processor` | annotation processor path | no                | for code generation tools like Lombok  |
+| `test`      | test classpath only       | no                | only available during `borneo test`    |
+
+Like for dependencies, repository sources can be added and customized:
 
 ```kdl
 group "com.example"
@@ -82,8 +94,8 @@ version "1.0.0"
 
 repositories {
     central enabled="false" // disables the Maven central repository
-
-    "https://repo.papermc.io/repository/maven-public"
+    "https://repo.papermc.io/repository/maven-public" checksum-policy="warn"
+    "central.sonatype.com/repository/maven-snapshots"
 }
 
 dependencies {
@@ -91,39 +103,85 @@ dependencies {
 }
 ```
 
+The order in which repositories are declared dictates how the resolver selects results. If an artifact exists in multiple repositories, the first declared repository wins. By default, the Maven Central repository is implicitly declared at highest priority, you can change this:
+
+```kdl
+repositories {
+    "central.sonatype.com/repository/maven-snapshots"
+    central
+}
+```
+
+Different checksum policies exist for repositories:
+
+| policy           | missing checksum | mismatched checksum |
+|------------------|------------------|---------------------|
+| `required`       | error            | error               |
+| `fail` (default) | ok               | error               |
+| `warn`           | ok               | warning             |
+| `ignore`         | ok               | ok                  |
+
+The default strategy for searches is to race all repository look-ups. It may be desired to have the search be sequential, use the `strategy` property to choose your preferred strategy:
+
+```kdl
+repositories strategy="sequential" { ... }
+```
+
 Running `borneo build` (or `borneo b`) will resolve all dependencies, fetching all POMs, BOMs, parents, and the whole ordeal, then de-duplicates dependencies, prioritizing by least distant from root declaration, like Maven does, and downloads them into the cache directory. It finally generates the `borneo.lock` file, describing all present dependencies computed and allowing borneo to skip this process next time it runs, if no dependencies or repositories change.
 
-#### Build configuration
+### Build configuration
 
-In many cases, you might want to create a fat JAR (_shadowing_ dependencies). Borneo has limited support for this operation, though relocation is still a WIP.
+When left untouched, your built artifacts will be located in `build/my-artifact-0.1.0.jar`, but sometimes you need a little bit more. The `build` node allows you to customize how your artifact is built.
 
 ```kdl
 group "rs.luiz"
 artifact "my-plugin"
 version "1.0.0"
 
-repositories {
-    "https://repo.papermc.io/repository/maven-public"
-}
-
 dependencies {
-    compile "com.google.code.gson:gson:2.11.0"
     compile "org.apache.commons:commons-lang3:3.17.0"
-    provided "io.papermc.paper:paper-api:1.21.11-R0.1-SNAPSHOT"
 }
 
 build {
-    output "./server/plugins/my-plugin.jar"
+    output "./path/to/my.jar"
     shadow "true"
+
+    post-build "echo $BORNEO_BUILD_OUTPUT"
+
+    manifest {
+        Implementation-Title "My App"
+        Implementation-Version "1.0.0"
+        Built-By "borneo"
+    }
 }
 ```
 
-The resulting `my-plugin.jar` will have all `compile` and `runtime` dependencies shadowed. In this case, `gson` and `commons-lang3`.
+These are all the relevant build options. `manifest` is written as a K-V list of entries to be written to `META-INF/MANIFEST.MF`. `shadow` toggles bundling of dependencies into your final JAR, if no `output` is declared, it will be located in `build/my-artifact-0.1.0-all.jar`. `post-build` executes a shell command after the build step, and has the `BORNEO_BUILD_OUTPUT` environment variable available.
 
-Another build option is also available, `post-build` executes a shell command after the build step, and has the `BORNEO_BUILD_OUTPUT` environment variable available:
+### Java node
+
+A `java` node is available. It allows you to declare the minimum supported Java release and common compiler arguments you might want to pass to `javac` invocations:
 
 ```kdl
-build {
-  post-build "echo $BORNEO_BUILD_OUTPUT"
+java {
+    release "21"
+    compiler-args "-Xlint:deprecation" "-Xlint:unchecked"
 }
 ```
+
+If the `JAVA_HOME` version is older than the one in `release`, Borneo will raise an error.
+
+### Testing
+
+Testing is in... a rough shape. It is somewhat supported if you run more modern testing setups. For the `borneo test` command to be available, you must declare `org.junit.platform:junit-platform-console-standalone` as a test dependency. I suggest you take a look at how it works. In most cases, it will be able to run your test suite regardless of what framework you use (JUnit, TestNG, etc). A node is also available for limited customization:
+
+```kdl
+test {
+    source "src/test/java"
+    resources "src/test/resources"
+    jvm-args "-Xmx512m" "-ea"
+}
+```
+
+> `source` and `resources` are optional fields.
+
