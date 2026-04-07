@@ -22,16 +22,20 @@ pub enum Commands {
     /// Run tests
     #[command(alias = "t")]
     Test(TestCommand),
-    /// Remove build artifacts
+    /// Remove build artifacts and purge stale cache entries
     Clean(CleanCommand),
 }
 
 #[derive(clap::Args)]
 pub struct ProjectArgs {
+    /// Base directory used to calculate all other paths.
+    #[arg(long)]
+    pub base: Option<PathBuf>,
+
+    /// Path to the project's manifest file. If a directory is provided, the borneo.kdl file
+    /// will be searched in it. Relative to base.
     #[arg(long)]
     pub manifest: Option<PathBuf>,
-    #[arg(long, short)]
-    pub base: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -39,9 +43,11 @@ pub struct BuildArgs {
     #[command(flatten)]
     pub project_args: ProjectArgs,
 
+    /// Destination of the final artifact produced by the build. Relative to base.
     #[arg(long, short)]
     pub out: Option<PathBuf>,
 
+    /// The packaging of the final artifact, possible values are: `jar`, `dir`. Default is `jar`.
     #[arg(long, short, value_enum)]
     pub packaging: Option<Packaging>,
 }
@@ -82,6 +88,7 @@ pub struct RunCommand {
     #[command(flatten)]
     pub build_args: BuildArgs,
 
+    /// Entry class.
     #[arg(long, short)]
     pub entry: Option<String>,
 

@@ -155,6 +155,7 @@ impl Java {
         run_cmd(&mut cmd, "java")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_tests<'a>(
         &self,
         base: &Path,

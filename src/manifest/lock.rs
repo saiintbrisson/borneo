@@ -4,8 +4,8 @@ use anyhow::Context;
 use camino::Utf8PathBuf;
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
-use crate::manifest::{ArtifactType, PomScope, Scope};
-use crate::types::{ArtifactCoordinates, ArtifactKey};
+use crate::manifest::{PomScope, Scope};
+use crate::types::{ArtifactCoordinates, ArtifactType, ExclusionKey};
 
 pub struct Lock {
     pub version: String,
@@ -32,7 +32,7 @@ pub struct LockArtifact {
     pub depth: usize,
     pub position: Vec<usize>,
     pub dependencies: BTreeMap<ArtifactCoordinates, PomScope>,
-    pub exclusions: BTreeSet<ArtifactKey>,
+    pub exclusions: BTreeSet<ExclusionKey>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -155,7 +155,7 @@ fn parse_lock_artifact(node: &KdlNode) -> anyhow::Result<LockArtifact> {
 
     let classifier = node_prop_str(node, "classifier");
     let artifact_type = node_prop_str(node, "type")
-        .map(ArtifactType)
+        .map(ArtifactType::new)
         .unwrap_or_default();
 
     let effective_scope: Scope = node_prop_str(node, "scope")

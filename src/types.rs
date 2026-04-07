@@ -80,21 +80,21 @@ impl std::fmt::Display for ArtifactVersion {
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ArtifactKey(GroupId, ArtifactId);
+pub struct ExclusionKey(GroupId, ArtifactId);
 
-impl ArtifactKey {
+impl ExclusionKey {
     pub fn new(group_id: GroupId, artifact_id: ArtifactId) -> Self {
         Self(group_id, artifact_id)
     }
 }
 
-impl FromStr for ArtifactKey {
+impl FromStr for ExclusionKey {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (gid, aid) = s
             .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("missing ':' in artifact key"))?;
+            .ok_or_else(|| anyhow::anyhow!("missing ':' in exclusion key"))?;
         Ok(Self(
             GroupId(gid.replace('/', ".")),
             ArtifactId(aid.to_string()),
@@ -102,19 +102,19 @@ impl FromStr for ArtifactKey {
     }
 }
 
-impl std::fmt::Display for ArtifactKey {
+impl std::fmt::Display for ExclusionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}", self.0.0, self.1.0)
     }
 }
 
-impl std::fmt::Debug for ArtifactKey {
+impl std::fmt::Debug for ExclusionKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ArtifactKey({}:{})", self.0.0, self.1.0)
+        write!(f, "ExclusionKey({}:{})", self.0.0, self.1.0)
     }
 }
 
-impl<'de> serde::Deserialize<'de> for ArtifactKey {
+impl<'de> serde::Deserialize<'de> for ExclusionKey {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -125,12 +125,78 @@ impl<'de> serde::Deserialize<'de> for ArtifactKey {
     }
 }
 
-impl serde::Serialize for ArtifactKey {
+impl serde::Serialize for ExclusionKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         serializer.serialize_str(&self.to_string())
+    }
+}
+
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArtifactKey {
+    group_id: GroupId,
+    artifact_id: ArtifactId,
+    artifact_type: ArtifactType,
+    classifier: Option<String>,
+}
+
+impl std::fmt::Display for ArtifactKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}",
+            self.group_id.0, self.artifact_id.0, self.artifact_type
+        )?;
+        if let Some(c) = &self.classifier {
+            write!(f, ":{c}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for ArtifactKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ArtifactKey({self})")
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArtifactType(String);
+
+impl ArtifactType {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    pub fn extension(&self) -> &str {
+        match self.0.as_str() {
+            "test-jar" | "maven-plugin" | "ejb" | "ejb-client" | "java-source" | "javadoc" => "jar",
+            other => other,
+        }
+    }
+
+    pub fn implied_classifier(&self) -> Option<&str> {
+        match self.0.as_str() {
+            "test-jar" => Some("tests"),
+            "ejb-client" => Some("client"),
+            "java-source" => Some("sources"),
+            "javadoc" => Some("javadoc"),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ArtifactType {
+    fn default() -> Self {
+        Self("jar".into())
+    }
+}
+
+impl std::fmt::Display for ArtifactType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -158,8 +224,13 @@ impl ArtifactCoordinates {
         &self.2
     }
 
-    pub fn key(&self) -> ArtifactKey {
-        ArtifactKey(self.0.clone(), self.1.clone())
+    pub fn key(&self, artifact_type: &ArtifactType, classifier: Option<&str>) -> ArtifactKey {
+        ArtifactKey {
+            group_id: self.0.clone(),
+            artifact_id: self.1.clone(),
+            artifact_type: artifact_type.clone(),
+            classifier: classifier.map(|s| s.to_string()),
+        }
     }
 }
 

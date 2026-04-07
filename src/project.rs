@@ -391,8 +391,13 @@ impl Project {
                     .iter()
                     .map(|a| {
                         let ext = a.artifact_type.extension();
+                        let classifier_suffix = a
+                            .classifier
+                            .as_deref()
+                            .map(|c| format!("-{c}"))
+                            .unwrap_or_default();
                         format!(
-                            "{}-{}-{}.{ext}",
+                            "{}-{}-{}{classifier_suffix}.{ext}",
                             a.coord.group_id().as_str(),
                             a.coord.artifact_id().as_str(),
                             a.coord.version().as_str(),
@@ -428,8 +433,7 @@ impl Project {
         let (java, classes_dir) = self.compile_main().await?;
         let manifest = self.manifest.as_ref().unwrap();
 
-        const STANDALONE_PREFIX: &str =
-            "org.junit.platform-junit-platform-console-standalone-";
+        const STANDALONE_PREFIX: &str = "org.junit.platform-junit-platform-console-standalone-";
 
         let standalone_jar = self
             .class_path
@@ -622,9 +626,12 @@ async fn resolve_artifacts(
         let Some(coord) = dep.coord() else {
             continue;
         };
-        loader
-            .clone()
-            .spawn_load_artifact(coord.clone(), LoaderBranch::new(dep.exclusions.clone(), i));
+        loader.clone().spawn_load_artifact(
+            coord.clone(),
+            dep.artifact_type.clone(),
+            dep.classifier.clone(),
+            LoaderBranch::new(dep.exclusions.clone(), i),
+        );
     }
 
     let resolved = loader.into_resolved().await?;
@@ -703,8 +710,13 @@ async fn download_and_lock(
 
     for artifact in &resolved.artifacts {
         let ext = artifact.artifact_type.extension();
+        let classifier_suffix = artifact
+            .classifier
+            .as_deref()
+            .map(|c| format!("-{c}"))
+            .unwrap_or_default();
         let file_name = format!(
-            "{}-{}-{}.{ext}",
+            "{}-{}-{}{classifier_suffix}.{ext}",
             artifact.coord.group_id().as_str(),
             artifact.coord.artifact_id().as_str(),
             artifact.coord.version().as_str(),
@@ -714,7 +726,7 @@ async fn download_and_lock(
         let expected_digest = prev_lock.as_ref().and_then(|lock| {
             lock.artifacts
                 .iter()
-                .find(|a| a.coord == artifact.coord)
+                .find(|a| a.coord == artifact.coord && a.classifier == artifact.classifier)
                 .map(|a| a.checksum.digest().to_vec())
         });
 
@@ -731,10 +743,10 @@ async fn download_and_lock(
         if let Some(digest) = &expected_digest
             && verify_cached(&out, digest)
         {
-            let (rank, _, _) = resolved.slot_map.get(&artifact.coord.key()).unwrap();
+            let (rank, _, _) = resolved.slot_map.get(&artifact.key()).unwrap();
             lock_artifacts.insert(LockArtifact {
                 coord: artifact.coord.clone(),
-                classifier: None,
+                classifier: artifact.classifier.clone(),
                 artifact_type: artifact.artifact_type.clone(),
                 source: artifact.source.clone(),
                 artifact_path: artifact.artifact_path.clone(),
@@ -749,7 +761,7 @@ async fn download_and_lock(
             continue;
         }
 
-        to_download.push((artifact.clone(), out, exclusions, scope, ext.to_string()));
+        to_download.push((artifact.clone(), out, exclusions, scope));
     }
 
     if to_download.is_empty() {
@@ -761,35 +773,33 @@ async fn download_and_lock(
         });
     }
 
-    for (artifact, _, _, _, _) in &to_download {
+    for (artifact, _, _, _) in &to_download {
         status.downloading(&artifact.coord);
     }
 
     let results: Vec<anyhow::Result<_>> =
-        futures_util::stream::iter(to_download.iter().map(|(artifact, out, _, _, ext)| async {
+        futures_util::stream::iter(to_download.iter().map(|(artifact, out, _, _)| async {
             let out = Utf8PathBuf::from(out.to_string_lossy().to_string());
-            let sha256 = resolved
-                .download_artifact(&artifact.coord, ext, &out)
-                .await?;
+            let sha256 = resolved.download_artifact(artifact, &out).await?;
 
             status::StatusHandle::get().downloaded(&artifact.coord);
 
-            Ok((artifact.coord.clone(), sha256))
+            Ok((artifact.key(), sha256))
         }))
         .buffer_unordered(8)
         .collect()
         .await;
 
     for result in results {
-        let (coord, sha256) = result?;
-        let (artifact, out, exclusions, scope, _) = to_download
+        let (key, sha256) = result?;
+        let (artifact, out, exclusions, scope) = to_download
             .iter()
-            .find(|(a, _, _, _, _)| a.coord == coord)
+            .find(|(a, _, _, _)| a.key() == key)
             .context("download result does not match any queued artifact")?;
-        let (rank, _, _) = resolved.slot_map.get(&coord.key()).unwrap();
+        let (rank, _, _) = resolved.slot_map.get(&key).unwrap();
         lock_artifacts.insert(LockArtifact {
-            coord,
-            classifier: None,
+            coord: artifact.coord.clone(),
+            classifier: artifact.classifier.clone(),
             artifact_type: artifact.artifact_type.clone(),
             source: artifact.source.clone(),
             artifact_path: artifact.artifact_path.clone(),

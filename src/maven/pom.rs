@@ -1,51 +1,14 @@
-#![allow(dead_code)]
-
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
-
-use camino::Utf8PathBuf;
 use serde::Deserialize;
 
-use crate::types::{ArtifactId, ArtifactKey, ArtifactVersion, GroupId};
+use crate::types::{ArtifactId, ArtifactVersion, ExclusionKey, GroupId};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Pom {
-    pub parent: Option<Parent>,
-
-    pub group_id: Option<GroupId>,
-    pub artifact_id: ArtifactId,
-    pub version: Option<ArtifactVersion>,
-
-    pub name: Option<String>,
-    pub description: Option<String>,
-    pub url: Option<String>,
-
-    #[serde(default)]
-    pub properties: HashMap<String, String>,
-
     pub dependency_management: Option<DependencyManagement>,
 
     #[serde(default)]
     pub dependencies: Vec<Dependency>,
-}
-
-impl Pom {
-    pub fn group_id(&self) -> &GroupId {
-        self.group_id
-            .as_ref()
-            .or_else(|| Some(&self.parent.as_ref()?.group_id))
-            .expect("POM must have group_id")
-    }
-
-    pub fn version(&self) -> &ArtifactVersion {
-        self.version
-            .as_ref()
-            .or_else(|| self.parent.as_ref()?.version.as_ref())
-            .expect("POM must have version")
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -54,26 +17,12 @@ pub struct Parent {
     pub group_id: GroupId,
     pub artifact_id: ArtifactId,
     pub version: Option<ArtifactVersion>,
-    pub relative_path: Option<Utf8PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DependencyManagement {
     pub dependencies: Vec<Dependency>,
-}
-
-impl Pom {
-    pub fn to_jar_path(&self, suffix: Option<&str>) -> PathBuf {
-        let path = &format!(
-            "{}-{}{}.jar",
-            self.artifact_id.as_str(),
-            self.version().as_str(),
-            suffix.unwrap_or("")
-        );
-        let path: &Path = path.as_ref();
-        path.to_path_buf()
-    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -84,18 +33,23 @@ pub struct Dependency {
     pub version: Option<ArtifactVersion>,
 
     #[serde(default)]
-    pub r#type: DependencyType,
+    pub scope: DependencyScope,
+
+    #[serde(default = "default_dependency_type")]
+    pub r#type: String,
 
     #[serde(default)]
-    pub scope: DependencyScope,
+    pub classifier: Option<String>,
 
     #[serde(default)]
     pub optional: bool,
 
-    pub system_path: Option<String>,
-
     #[serde(default)]
     pub exclusions: Vec<Exclusion>,
+}
+
+fn default_dependency_type() -> String {
+    "jar".to_string()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -106,24 +60,8 @@ pub struct Exclusion {
 }
 
 impl Exclusion {
-    pub fn to_key(&self) -> ArtifactKey {
-        ArtifactKey::new(self.group_id.clone(), self.artifact_id.clone())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
-#[serde(transparent)]
-pub struct DependencyType(String);
-
-impl Default for DependencyType {
-    fn default() -> Self {
-        Self("jar".into())
-    }
-}
-
-impl DependencyType {
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub fn to_key(&self) -> ExclusionKey {
+        ExclusionKey::new(self.group_id.clone(), self.artifact_id.clone())
     }
 }
 

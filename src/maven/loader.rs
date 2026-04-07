@@ -12,14 +12,14 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use tokio::sync::watch;
 
 use crate::{
-    manifest::{ArtifactType, PomScope, lock::Lock},
+    manifest::{PomScope, lock::Lock},
     maven::{
         ClientError, MAVEN_POM_SUFFIX, MavenRepositoryClient,
         pom::{Dependency, DependencyScope, Parent, Pom},
         xml::{XmlFile, XmlNode},
     },
     status::StatusHandle,
-    types::{ArtifactCoordinates, ArtifactKey, ArtifactVersion},
+    types::{ArtifactCoordinates, ArtifactKey, ArtifactType, ArtifactVersion, ExclusionKey},
 };
 
 type Cache<K, V> = DashMap<K, CacheEntry<V>>;
@@ -47,18 +47,26 @@ pub struct ResolvedArtifact {
     pub source: String,
     pub artifact_path: Utf8PathBuf,
     pub artifact_type: ArtifactType,
+    pub classifier: Option<String>,
     pub dependencies: BTreeMap<ArtifactCoordinates, PomScope>,
+}
+
+impl ResolvedArtifact {
+    pub fn key(&self) -> ArtifactKey {
+        self.coord
+            .key(&self.artifact_type, self.classifier.as_deref())
+    }
 }
 
 #[derive(Clone)]
 pub struct LoaderBranch {
     pub depth: usize,
-    exclusions: BTreeSet<ArtifactKey>,
+    exclusions: BTreeSet<ExclusionKey>,
     position: Vec<usize>,
 }
 
 impl LoaderBranch {
-    pub fn new(exclusions: BTreeSet<ArtifactKey>, position: usize) -> Self {
+    pub fn new(exclusions: BTreeSet<ExclusionKey>, position: usize) -> Self {
         Self {
             depth: 0,
             exclusions,
@@ -66,7 +74,11 @@ impl LoaderBranch {
         }
     }
 
-    fn child(&self, index: usize, extra_exclusions: impl IntoIterator<Item = ArtifactKey>) -> Self {
+    fn child(
+        &self,
+        index: usize,
+        extra_exclusions: impl IntoIterator<Item = ExclusionKey>,
+    ) -> Self {
         let mut exclusions = self.exclusions.clone();
         exclusions.extend(extra_exclusions);
         let mut position = self.position.clone();
@@ -78,7 +90,7 @@ impl LoaderBranch {
         }
     }
 
-    fn is_excluded(&self, key: &ArtifactKey) -> bool {
+    fn is_excluded(&self, key: &ExclusionKey) -> bool {
         self.exclusions.contains(key)
     }
 }
@@ -144,38 +156,64 @@ impl MavenLoader {
             return;
         }
 
-        let by_coord: HashMap<_, _> = lock.artifacts.iter().map(|a| (&a.coord, a)).collect();
+        let lock_key = |la: &crate::manifest::lock::LockArtifact| -> ArtifactKey {
+            la.coord.key(&la.artifact_type, la.classifier.as_deref())
+        };
 
-        let manifest_coords: BTreeSet<_> = deps.iter().filter_map(|d| d.coord()).collect();
+        let by_key: HashMap<ArtifactKey, &crate::manifest::lock::LockArtifact> =
+            lock.artifacts.iter().map(|a| (lock_key(a), a)).collect();
+
+        let mut coord_to_keys: HashMap<ArtifactCoordinates, Vec<ArtifactKey>> = HashMap::new();
+        for la in &lock.artifacts {
+            coord_to_keys
+                .entry(la.coord.clone())
+                .or_default()
+                .push(lock_key(la));
+        }
+
+        let manifest_keys: BTreeSet<_> = deps
+            .iter()
+            .filter_map(|d| {
+                let coord = d.coord()?;
+                Some(coord.key(&d.artifact_type, d.classifier.as_deref()))
+            })
+            .collect();
 
         let mut invalidated_keys = BTreeSet::new();
 
         for la in &lock.artifacts {
-            if la.depth == 0 && !manifest_coords.contains(&la.coord) {
-                invalidated_keys.insert(la.coord.key());
+            let key = lock_key(la);
+            if la.depth == 0 && !manifest_keys.contains(&key) {
+                invalidated_keys.insert(key);
             }
         }
 
         for dep in deps {
             let Some(coord) = dep.coord() else { continue };
-            let lock_match = by_coord.get(coord);
+            let key = coord.key(&dep.artifact_type, dep.classifier.as_deref());
+            let lock_match = by_key.get(&key);
             let changed = match lock_match {
                 None => true,
                 Some(la) => la.exclusions != dep.exclusions,
             };
             if changed {
-                invalidated_keys.insert(coord.key());
+                invalidated_keys.insert(key);
             }
         }
 
         if !invalidated_keys.is_empty() {
-            let mut reverse_deps: HashMap<_, Vec<_>> = HashMap::new();
+            let mut reverse_deps: HashMap<ArtifactKey, Vec<ArtifactKey>> = HashMap::new();
             for la in &lock.artifacts {
+                let la_key = lock_key(la);
                 for dep_coord in la.dependencies.keys() {
-                    reverse_deps
-                        .entry(dep_coord.key())
-                        .or_default()
-                        .push(la.coord.key());
+                    if let Some(dep_keys) = coord_to_keys.get(dep_coord) {
+                        for dep_key in dep_keys {
+                            reverse_deps
+                                .entry(dep_key.clone())
+                                .or_default()
+                                .push(la_key.clone());
+                        }
+                    }
                 }
             }
 
@@ -196,28 +234,33 @@ impl MavenLoader {
 
         for dep in deps {
             let Some(coord) = dep.coord() else { continue };
-            if invalidated_keys.contains(&coord.key()) {
+            let key = coord.key(&dep.artifact_type, dep.classifier.as_deref());
+            if invalidated_keys.contains(&key) {
                 continue;
             }
-            let Some(lock_artifact) = by_coord.get(coord) else {
+            let Some(lock_artifact) = by_key.get(&key) else {
                 continue;
             };
             if lock_artifact.exclusions != dep.exclusions {
                 continue;
             }
-            queue.push_back(coord.clone());
+            queue.push_back(key);
         }
 
-        while let Some(coord) = queue.pop_front() {
-            if !reachable.insert(coord.clone()) {
+        while let Some(key) = queue.pop_front() {
+            if !reachable.insert(key.clone()) {
                 continue;
             }
-            if invalidated_keys.contains(&coord.key()) {
+            if invalidated_keys.contains(&key) {
                 continue;
             }
-            if let Some(lock_artifact) = by_coord.get(&coord) {
+            if let Some(lock_artifact) = by_key.get(&key) {
                 for dep_coord in lock_artifact.dependencies.keys() {
-                    queue.push_back(dep_coord.clone());
+                    if let Some(dep_keys) = coord_to_keys.get(dep_coord) {
+                        for dep_key in dep_keys {
+                            queue.push_back(dep_key.clone());
+                        }
+                    }
                 }
             }
         }
@@ -227,7 +270,7 @@ impl MavenLoader {
         for lock_artifact in lock
             .artifacts
             .iter()
-            .filter(|a| reachable.contains(&a.coord))
+            .filter(|a| reachable.contains(&lock_key(a)))
         {
             let repo = repos
                 .entry(lock_artifact.source.clone())
@@ -247,11 +290,13 @@ impl MavenLoader {
                 source: lock_artifact.source.clone(),
                 artifact_path: lock_artifact.artifact_path.clone(),
                 artifact_type: lock_artifact.artifact_type.clone(),
+                classifier: lock_artifact.classifier.clone(),
                 dependencies: lock_artifact.dependencies.clone(),
             });
 
+            let key = resolved.key();
             self.artifacts.insert(
-                lock_artifact.coord.key(),
+                key,
                 ArtifactSlot {
                     rank,
                     coord: lock_artifact.coord.clone(),
@@ -264,9 +309,13 @@ impl MavenLoader {
     async fn load_artifact(
         self: Arc<Self>,
         coord: ArtifactCoordinates,
+        artifact_type: ArtifactType,
+        classifier: Option<String>,
         branch: LoaderBranch,
     ) -> anyhow::Result<()> {
-        let key = coord.key();
+        let classifier =
+            classifier.or_else(|| artifact_type.implied_classifier().map(|s| s.to_string()));
+        let key = coord.key(&artifact_type, classifier.as_deref());
         let rank: Rank = (branch.depth, branch.position.clone());
 
         let tx = match self.artifacts.entry(key.clone()) {
@@ -309,7 +358,8 @@ impl MavenLoader {
             source,
             coord: coord.clone(),
             artifact_path: artifact_path.as_ref().clone(),
-            artifact_type: Default::default(),
+            artifact_type,
+            classifier,
             dependencies: dep_coords,
         });
 
@@ -376,10 +426,16 @@ impl MavenLoader {
                 _ => continue,
             };
 
-            let key = ArtifactKey::new(dep.group_id.clone(), dep.artifact_id.clone());
-            if branch.is_excluded(&key) {
+            let excl_key = ExclusionKey::new(dep.group_id.clone(), dep.artifact_id.clone());
+            if branch.is_excluded(&excl_key) {
                 continue;
             }
+
+            let dep_type = ArtifactType::new(&dep.r#type);
+            let classifier = dep
+                .classifier
+                .clone()
+                .or_else(|| dep_type.implied_classifier().map(|s| s.to_string()));
 
             let coord = ArtifactCoordinates::new(
                 dep.group_id.clone(),
@@ -396,19 +452,34 @@ impl MavenLoader {
             dep_coords.insert(coord.clone(), pom_scope);
 
             let child = branch.child(i, dep.exclusions.iter().map(|e| e.to_key()));
-            self.clone().spawn_load_artifact(coord, child);
+            self.clone()
+                .spawn_load_artifact(coord, dep_type, classifier, child);
         }
 
         Ok(dep_coords)
     }
 
-    pub fn spawn_load_artifact(self: Arc<Self>, coord: ArtifactCoordinates, branch: LoaderBranch) {
+    pub fn spawn_load_artifact(
+        self: Arc<Self>,
+        coord: ArtifactCoordinates,
+        artifact_type: ArtifactType,
+        classifier: Option<String>,
+        branch: LoaderBranch,
+    ) {
         let artifacts = self.artifacts.clone();
         let rank: Rank = (branch.depth, branch.position.clone());
         tokio::spawn(async move {
-            if let Err(e) = self.load_artifact(coord.clone(), branch).await {
+            if let Err(e) = self
+                .load_artifact(
+                    coord.clone(),
+                    artifact_type.clone(),
+                    classifier.clone(),
+                    branch,
+                )
+                .await
+            {
                 StatusHandle::get().end(coord.to_string());
-                let key = coord.key();
+                let key = coord.key(&artifact_type, classifier.as_deref());
                 let err = Arc::new(e);
                 match artifacts.entry(key) {
                     dashmap::Entry::Occupied(existing)
@@ -474,18 +545,25 @@ pub struct ResolvedDependencies {
 impl ResolvedDependencies {
     pub async fn download_artifact(
         &self,
-        coord: &ArtifactCoordinates,
-        ext: &str,
+        artifact: &ResolvedArtifact,
         out: &Utf8Path,
     ) -> anyhow::Result<Vec<u8>> {
-        let (_, repo, artifact) = self
+        let key = artifact.key();
+        let (_, repo, _) = self
             .slot_map
-            .get(&coord.key())
-            .context("coord must be resolved first")?;
-        let path = artifact.artifact_path.with_added_extension(ext);
-        let key = format!("dl:{coord}");
+            .get(&key)
+            .context("artifact must be resolved first")?;
+        let ext = artifact.artifact_type.extension();
+        let path = if let Some(classifier) = &artifact.classifier {
+            let base = artifact.artifact_path.as_str();
+            Utf8PathBuf::from(format!("{base}-{classifier}.{ext}"))
+        } else {
+            artifact.artifact_path.with_added_extension(ext)
+        };
+        let coord = &artifact.coord;
+        let dl_key = format!("dl:{coord}");
         let asset = repo
-            .download_asset(path.as_str(), out, Some(&key))
+            .download_asset(path.as_str(), out, Some(&dl_key))
             .await
             .with_context(|| format!("failed to download {coord}"))?;
 

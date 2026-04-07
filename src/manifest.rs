@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use kdl::{KdlDocument, KdlNode, KdlValue};
 use miette::{LabeledSpan, NamedSource};
 
-use crate::types::{ArtifactCoordinates, ArtifactId, ArtifactKey, ArtifactVersion, GroupId};
+use crate::types::{
+    ArtifactCoordinates, ArtifactId, ArtifactType, ArtifactVersion, ExclusionKey, GroupId,
+};
 
 pub mod lock;
 
@@ -219,32 +221,12 @@ pub fn mediate(parent_scope: Scope, pom_scope: PomScope) -> Scope {
     }
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ArtifactType(pub(crate) String);
-
-impl Default for ArtifactType {
-    fn default() -> Self {
-        Self("jar".into())
-    }
-}
-
-impl ArtifactType {
-    pub fn extension(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for ArtifactType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 pub struct Dependency {
     pub scope: Scope,
     pub artifact_type: ArtifactType,
+    pub classifier: Option<String>,
     pub source: DependencySource,
-    pub exclusions: BTreeSet<ArtifactKey>,
+    pub exclusions: BTreeSet<ExclusionKey>,
 }
 
 pub enum DependencySource {
@@ -664,7 +646,7 @@ fn parse_dependency(node: &KdlNode, src: &NamedSource<String>) -> miette::Result
 
             match entry.value() {
                 KdlValue::String(s) => {
-                    let key: ArtifactKey = s.parse().map_err(|e: anyhow::Error| {
+                    let key: ExclusionKey = s.parse().map_err(|e: anyhow::Error| {
                         miette::miette!(
                             labels = vec![LabeledSpan::at(entry.span(), "invalid artifact key")],
                             "{e}"
@@ -687,14 +669,20 @@ fn parse_dependency(node: &KdlNode, src: &NamedSource<String>) -> miette::Result
     let artifact_type = node
         .entry("type")
         .and_then(|e| match e.value() {
-            KdlValue::String(s) => Some(ArtifactType(s.clone())),
+            KdlValue::String(s) => Some(ArtifactType::new(s.clone())),
             _ => None,
         })
         .unwrap_or_default();
 
+    let classifier = node.entry("classifier").and_then(|e| match e.value() {
+        KdlValue::String(s) => Some(s.clone()),
+        _ => None,
+    });
+
     Ok(Dependency {
         scope,
         artifact_type,
+        classifier,
         source,
         exclusions,
     })
