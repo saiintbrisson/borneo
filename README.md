@@ -1,6 +1,6 @@
 # Borneo
 
-Borneo is a compact Java build tool, inspired by Cargo, made to suit simple projects. It's designed to be modern and slim. It supports Maven repositories and dependencies, maintains a per-project a lockfile and dependency cache. Borneo does not maintain a global repository, XML files are discarded after the lockfile is computed.
+Borneo is a compact Java build tool, inspired by Cargo, made to suit simple projects. It's designed to be modern and slim. It supports Maven repositories and dependencies, maintains a per-project a lockfile and libraries cache. Borneo does not maintain a global repository, XML files are discarded after the lockfile is computed.
 
 ## Getting started
 
@@ -130,7 +130,7 @@ The default strategy for searches is to race all repository look-ups. It may be 
 repositories strategy="sequential" { ... }
 ```
 
-Running `borneo build` (or `borneo b`) will resolve all dependencies, fetching all POMs, BOMs, parents, and the whole ordeal, then de-duplicates dependencies, prioritizing by least distant from root declaration, like Maven does, and downloads them into the cache directory. It finally generates the `borneo.lock` file, describing all present dependencies computed and allowing borneo to skip this process next time it runs, if no dependencies or repositories change.
+Running `borneo build` (or `borneo b`) will resolve all dependencies, fetching all POMs, BOMs, parents, and the whole ordeal, then de-duplicates dependencies, prioritizing by least distant from root declaration, like Maven does, and downloads them into the `build/libraries` directory. It finally generates the `borneo.lock` file, describing all present dependencies computed and allowing borneo to skip this process next time it runs, if no dependencies or repositories change.
 
 ### Build configuration
 

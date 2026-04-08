@@ -43,28 +43,42 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Build(cmd) => {
             let b = &cmd.build_args;
-            project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?
-                .build()
-                .await?;
+            project::Project::new(
+                &b.project_args,
+                b.out.as_ref(),
+                b.packaging,
+                b.entry.clone(),
+            )?
+            .build()
+            .await?;
             status::StatusHandle::get().log("");
         }
         Commands::Run(cmd) => {
             let b = &cmd.build_args;
-            let mut project = project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?;
+            let mut project = project::Project::new(
+                &b.project_args,
+                b.out.as_ref(),
+                b.packaging,
+                b.entry.clone(),
+            )?;
             let jar_path = project.build().await?;
 
             let native_dirs = project.native_library_dirs();
             status::StatusHandle::get().log("");
 
             if let Some(jar_path) = jar_path {
-                project
-                    .java()
-                    .run_jar(&project.dir, &jar_path, &native_dirs, &cmd.args)?;
+                project.java().run_jar(
+                    &project.dir,
+                    &jar_path,
+                    &native_dirs,
+                    project.entry.as_deref(),
+                    &cmd.args,
+                )?;
             } else {
-                let entry = cmd
+                let entry = project
                     .entry
-                    .as_ref()
-                    .or(project.manifest.as_ref().and_then(|m| m.entry.as_ref()))
+                    .as_deref()
+                    .or(project.manifest.as_ref().and_then(|m| m.entry.as_deref()))
                     .context("no entry point specified and none found in manifest")?;
 
                 project.java().run(
@@ -80,12 +94,23 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Test(cmd) => {
             let b = &cmd.build_args;
-            let mut project = project::Project::new(&b.project_args, b.out.as_ref(), b.packaging)?;
+            let mut project = project::Project::new(
+                &b.project_args,
+                b.out.as_ref(),
+                b.packaging,
+                b.entry.clone(),
+            )?;
             project.test(&cmd).await?;
             status::StatusHandle::get().log("");
         }
+        Commands::Sync(cmd) => {
+            project::Project::new(&cmd.project_args, None, None, None)?
+                .sync()
+                .await?;
+            status::StatusHandle::get().log("");
+        }
         Commands::Clean(cmd) => {
-            project::Project::new(&cmd.project_args, None, None)?.clean(cmd.purge)?;
+            project::Project::new(&cmd.project_args, None, None, None)?.clean(cmd.purge)?;
         }
     }
 

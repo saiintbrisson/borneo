@@ -44,6 +44,7 @@ pub struct Project {
     pub dir: PathBuf,
     pub build_dir: PathBuf,
     pub out: Option<PathBuf>,
+    pub entry: Option<String>,
     java: Option<crate::java::Java>,
     resources: Option<PathBuf>,
     packaging: Packaging,
@@ -67,6 +68,7 @@ impl Project {
         project: &ProjectArgs,
         out: Option<&PathBuf>,
         packaging: Option<Packaging>,
+        entry: Option<String>,
     ) -> Result<Self> {
         let dir = match &project.base {
             Some(base) => base
@@ -117,6 +119,7 @@ impl Project {
             dir: dir.clone(),
             build_dir,
             out,
+            entry,
             java: None,
             resources,
             packaging,
@@ -285,6 +288,16 @@ impl Project {
         Ok(compilers)
     }
 
+    pub async fn sync(&mut self) -> Result<()> {
+        if let Some(manifest) = &self.manifest
+            && let Some(kotlin_config) = &manifest.kotlin
+        {
+            crate::kotlin::Kotlin::new(kotlin_config.version.as_deref(), &self.build_dir).await?;
+        }
+
+        self.resolve_dependencies().await
+    }
+
     pub async fn build(&mut self) -> Result<Option<PathBuf>> {
         let classes_dir = self.compile_main().await?;
 
@@ -329,7 +342,10 @@ impl Project {
                     std::fs::remove_file(&final_jar).ok();
                 }
 
-                let entry = self.manifest.as_ref().and_then(|m| m.entry.as_deref());
+                let entry = self
+                    .entry
+                    .as_deref()
+                    .or(self.manifest.as_ref().and_then(|m| m.entry.as_deref()));
                 let manifest_entries = self
                     .manifest
                     .as_ref()
@@ -409,7 +425,7 @@ impl Project {
 
     pub fn clean(&self, purge: bool) -> Result<()> {
         if purge {
-            return self.purge_cache();
+            return self.purge_libraries();
         }
         if self.build_dir.exists() {
             std::fs::remove_dir_all(&self.build_dir).with_context(|| {
@@ -429,9 +445,9 @@ impl Project {
         Ok(())
     }
 
-    fn purge_cache(&self) -> Result<()> {
-        let cache_dir = self.build_dir.join("cache");
-        if !cache_dir.is_dir() {
+    fn purge_libraries(&self) -> Result<()> {
+        let libraries_dir = self.build_dir.join("libraries");
+        if !libraries_dir.is_dir() {
             return Ok(());
         }
 
@@ -462,7 +478,9 @@ impl Project {
             .unwrap_or_default();
 
         let mut removed = 0usize;
-        for entry in std::fs::read_dir(&cache_dir).context("failed to read cache directory")? {
+        for entry in
+            std::fs::read_dir(&libraries_dir).context("failed to read libraries directory")?
+        {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -473,7 +491,8 @@ impl Project {
         }
 
         if removed > 0 {
-            status::StatusHandle::get().log(format!("purged {removed} stale artifacts from cache"));
+            status::StatusHandle::get()
+                .log(format!("purged {removed} stale artifacts from libraries"));
         }
         Ok(())
     }
@@ -608,8 +627,8 @@ impl Project {
             return Ok(());
         };
 
-        let cache_dir = self.build_dir.join("cache");
-        std::fs::create_dir_all(&cache_dir).context("failed to create cache directory")?;
+        let libraries_dir = self.build_dir.join("libraries");
+        std::fs::create_dir_all(&libraries_dir).context("failed to create libraries directory")?;
 
         let lock_path = self.dir.join("borneo.lock");
         let prev_lock = read_lock(&lock_path)?;
@@ -644,7 +663,7 @@ impl Project {
             manifest,
             &resolved,
             &prev_lock,
-            &cache_dir,
+            &libraries_dir,
             &repo_urls,
         )
         .await?;
@@ -752,7 +771,7 @@ async fn download_and_lock(
     manifest: &manifest::Manifest,
     resolved: &ResolvedDependencies,
     prev_lock: &Option<Lock>,
-    cache_dir: &Path,
+    libraries_dir: &Path,
     repo_urls: &[String],
 ) -> Result<Lock> {
     let manifest_deps = &manifest.dependencies;
@@ -775,7 +794,7 @@ async fn download_and_lock(
             artifact.coord.artifact_id().as_str(),
             artifact.coord.version().as_str(),
         );
-        let out = cache_dir.join(&file_name);
+        let out = libraries_dir.join(&file_name);
 
         let expected_digest = prev_lock.as_ref().and_then(|lock| {
             lock.artifacts

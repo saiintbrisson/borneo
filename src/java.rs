@@ -193,15 +193,20 @@ impl Java {
         base: &Path,
         jar_path: &Path,
         native_dirs: &std::collections::BTreeSet<PathBuf>,
+        entry: Option<&str>,
         args: &[String],
     ) -> Result<()> {
         let mut cmd = Command::new(self.bin("java"));
         cmd.current_dir(base);
         cmd.args(self.encoding_flags());
         Self::apply_library_path(&mut cmd, native_dirs);
-        cmd.arg("-jar").arg(jar_path);
+        if let Some(entry) = entry {
+            cmd.arg("-cp").arg(jar_path).arg(entry);
+        } else {
+            cmd.arg("-jar").arg(jar_path);
+        }
         cmd.args(args);
-        run_cmd(&mut cmd, "java -jar")
+        run_cmd(&mut cmd, "java")
     }
 }
 

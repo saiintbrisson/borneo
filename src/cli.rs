@@ -1,7 +1,5 @@
 use std::path::PathBuf;
 
-use clap::ValueHint;
-
 use crate::manifest::Packaging;
 
 #[derive(clap::ValueEnum, Clone, Copy, Default, PartialEq, Eq)]
@@ -32,7 +30,10 @@ pub enum Commands {
     /// Run tests
     #[command(alias = "t")]
     Test(TestCommand),
-    /// Remove build artifacts and purge stale cache entries
+    /// Resolve dependencies and update the lock file
+    #[command(alias = "s")]
+    Sync(SyncCommand),
+    /// Remove build artifacts and purge stale libraries
     Clean(CleanCommand),
 }
 
@@ -60,6 +61,10 @@ pub struct BuildArgs {
     /// The packaging of the final artifact, possible values are: `jar`, `dir`. Default is `jar`.
     #[arg(long, short, value_enum)]
     pub packaging: Option<Packaging>,
+
+    /// Entry class, overrides the manifest.
+    #[arg(long, short)]
+    pub entry: Option<String>,
 }
 
 #[derive(clap::Args)]
@@ -69,11 +74,17 @@ pub struct BuildCommand {
 }
 
 #[derive(clap::Args)]
+pub struct SyncCommand {
+    #[command(flatten)]
+    pub project_args: ProjectArgs,
+}
+
+#[derive(clap::Args)]
 pub struct CleanCommand {
     #[command(flatten)]
     pub project_args: ProjectArgs,
 
-    /// Remove cached artifacts not in the current lock
+    /// Remove library artifacts not in the current lock
     #[arg(long)]
     pub purge: bool,
 }
@@ -98,10 +109,6 @@ pub struct RunCommand {
     #[command(flatten)]
     pub build_args: BuildArgs,
 
-    /// Entry class.
-    #[arg(long, short)]
-    pub entry: Option<String>,
-
-    #[arg(num_args = 1.., trailing_var_arg = true, value_hint = ValueHint::CommandWithArguments)]
+    #[arg(last = true)]
     pub args: Vec<String>,
 }
