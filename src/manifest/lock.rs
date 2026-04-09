@@ -4,12 +4,12 @@ use anyhow::Context;
 use camino::Utf8PathBuf;
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
-use crate::manifest::{PomScope, Scope};
+use crate::manifest::{PomDependency, PomScope, Scope};
 use crate::types::{ArtifactCoordinates, ArtifactType, ExclusionKey};
 
 pub struct Lock {
     pub version: String,
-    pub repositories: BTreeSet<String>,
+    pub fingerprint: String,
     pub artifacts: BTreeSet<LockArtifact>,
     pub local: BTreeSet<LocalArtifact>,
 }
@@ -29,9 +29,7 @@ pub struct LockArtifact {
     pub artifact_path: Utf8PathBuf,
     pub checksum: Checksum,
     pub effective_scope: Scope,
-    pub depth: usize,
-    pub position: Vec<usize>,
-    pub dependencies: BTreeMap<ArtifactCoordinates, PomScope>,
+    pub dependencies: BTreeMap<ArtifactCoordinates, PomDependency>,
     pub exclusions: BTreeSet<ExclusionKey>,
 }
 
@@ -74,14 +72,13 @@ impl Lock {
             })
             .unwrap_or_else(|| "1".to_string());
 
-        let mut repositories = BTreeSet::new();
-        if let Some(repos_node) = doc.get("repositories")
-            && let Some(children) = repos_node.children()
-        {
-            for node in children.nodes() {
-                repositories.insert(node.name().value().to_string());
-            }
-        }
+        let fingerprint = doc
+            .get_arg("fingerprint")
+            .and_then(|v| match v {
+                KdlValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
 
         let mut artifacts = BTreeSet::new();
         let mut local = BTreeSet::new();
@@ -95,7 +92,7 @@ impl Lock {
 
         Ok(Lock {
             version,
-            repositories,
+            fingerprint,
             artifacts,
             local,
         })
@@ -110,14 +107,12 @@ impl Lock {
             .push(KdlEntry::new(KdlValue::String(self.version.clone())));
         doc.nodes_mut().push(version_node);
 
-        if !self.repositories.is_empty() {
-            let mut repos_node = KdlNode::new("repositories");
-            let mut children = KdlDocument::new();
-            for url in &self.repositories {
-                children.nodes_mut().push(KdlNode::new(url.as_str()));
-            }
-            repos_node.set_children(children);
-            doc.nodes_mut().push(repos_node);
+        if !self.fingerprint.is_empty() {
+            let mut fp_node = KdlNode::new("fingerprint");
+            fp_node
+                .entries_mut()
+                .push(KdlEntry::new(KdlValue::String(self.fingerprint.clone())));
+            doc.nodes_mut().push(fp_node);
         }
 
         for artifact in &self.artifacts {
@@ -162,23 +157,6 @@ fn parse_lock_artifact(node: &KdlNode) -> anyhow::Result<LockArtifact> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(Scope::Compile);
 
-    let depth = node
-        .entry("depth")
-        .and_then(|e| match e.value() {
-            KdlValue::Integer(n) => Some(*n as usize),
-            _ => None,
-        })
-        .unwrap_or(0);
-
-    let position = node_prop_str(node, "position")
-        .map(|s| {
-            s.split('.')
-                .filter(|p| !p.is_empty())
-                .filter_map(|p| p.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-
     let mut dependencies = BTreeMap::new();
     let mut exclusions = BTreeSet::new();
 
@@ -193,11 +171,42 @@ fn parse_lock_artifact(node: &KdlNode) -> anyhow::Result<LockArtifact> {
                 .with_context(|| format!("{} missing value", child.name().value()))?;
 
             match child.name().value() {
-                "compile" => {
-                    dependencies.insert(val.parse()?, PomScope::Compile);
-                }
-                "runtime" => {
-                    dependencies.insert(val.parse()?, PomScope::Runtime);
+                "compile" | "runtime" => {
+                    let scope: PomScope = child.name().value().parse()?;
+                    let dep_type = node_prop_str(child, "type")
+                        .map(ArtifactType::new)
+                        .unwrap_or_default();
+                    let classifier = node_prop_str(child, "classifier");
+
+                    let mut dep_exclusions = BTreeSet::new();
+                    if let Some(dep_children) = child.children() {
+                        for excl_node in dep_children.nodes() {
+                            if excl_node.name().value() != "exclude" {
+                                anyhow::bail!(
+                                    "unexpected node in dependency: {}",
+                                    excl_node.name().value()
+                                );
+                            }
+                            let excl_val = excl_node
+                                .entry(0)
+                                .and_then(|e| match e.value() {
+                                    KdlValue::String(s) => Some(s.as_str()),
+                                    _ => None,
+                                })
+                                .context("exclude node missing value")?;
+                            dep_exclusions.insert(excl_val.parse()?);
+                        }
+                    }
+
+                    dependencies.insert(
+                        val.parse()?,
+                        PomDependency {
+                            scope,
+                            artifact_type: dep_type,
+                            classifier,
+                            exclusions: dep_exclusions,
+                        },
+                    );
                 }
                 "exclude" => {
                     exclusions.insert(val.parse()?);
@@ -215,8 +224,6 @@ fn parse_lock_artifact(node: &KdlNode) -> anyhow::Result<LockArtifact> {
         artifact_path,
         checksum,
         effective_scope,
-        depth,
-        position,
         dependencies,
         exclusions,
     })
@@ -248,20 +255,6 @@ impl LockArtifact {
         push_prop(&mut node, "checksum", &self.checksum.to_string());
         push_prop(&mut node, "scope", &self.effective_scope.to_string());
 
-        let mut depth_entry = KdlEntry::new(KdlValue::Integer(self.depth as i128));
-        depth_entry.set_name(Some(kdl::KdlIdentifier::from("depth")));
-        node.entries_mut().push(depth_entry);
-
-        if !self.position.is_empty() {
-            let pos_str = self
-                .position
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(".");
-            push_prop(&mut node, "position", &pos_str);
-        }
-
         if let Some(c) = &self.classifier {
             push_prop(&mut node, "classifier", c);
         }
@@ -272,11 +265,31 @@ impl LockArtifact {
         let has_children = !self.dependencies.is_empty() || !self.exclusions.is_empty();
         if has_children {
             let mut children = KdlDocument::new();
-            for (coord, pom_scope) in &self.dependencies {
-                let mut dep_node = KdlNode::new(pom_scope.to_string().as_str());
+            for (coord, pom_dep) in &self.dependencies {
+                let mut dep_node = KdlNode::new(pom_dep.scope.to_string().as_str());
                 dep_node
                     .entries_mut()
                     .push(KdlEntry::new(KdlValue::String(coord.to_string())));
+
+                if pom_dep.artifact_type.extension() != "jar" {
+                    push_prop(&mut dep_node, "type", pom_dep.artifact_type.extension());
+                }
+                if let Some(c) = &pom_dep.classifier {
+                    push_prop(&mut dep_node, "classifier", c);
+                }
+
+                if !pom_dep.exclusions.is_empty() {
+                    let mut dep_children = KdlDocument::new();
+                    for excl in &pom_dep.exclusions {
+                        let mut excl_node = KdlNode::new("exclude");
+                        excl_node
+                            .entries_mut()
+                            .push(KdlEntry::new(KdlValue::String(excl.to_string())));
+                        dep_children.nodes_mut().push(excl_node);
+                    }
+                    dep_node.set_children(dep_children);
+                }
+
                 children.nodes_mut().push(dep_node);
             }
             for excl in &self.exclusions {

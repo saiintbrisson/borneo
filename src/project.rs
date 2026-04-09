@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
@@ -16,7 +16,6 @@ use crate::{
     },
     maven::loader::{LoaderBranch, MavenLoader, ResolvedDependencies, verify_cached},
     status,
-    types::ArtifactCoordinates,
 };
 
 const NATIVE_EXTENSIONS: &[&str] = &["dll", "so", "dylib"];
@@ -653,18 +652,23 @@ impl Project {
             }
         }
 
-        let repo_entries = manifest.repositories.entries();
-        let repo_urls = manifest.repositories.urls();
-        let strategy = manifest.repositories.strategy;
-        let resolved =
-            resolve_artifacts(manifest, &prev_lock, repo_entries, &repo_urls, strategy).await?;
+        let fingerprint = manifest.dependency_fingerprint();
+        let resolved = if prev_lock
+            .as_ref()
+            .is_some_and(|l| l.fingerprint == fingerprint)
+        {
+            ResolvedDependencies::from_lock(prev_lock.as_ref().unwrap(), &reqwest::Client::new())
+        } else {
+            resolve_artifacts(manifest, &prev_lock).await?
+        };
+
         let mut lock = download_and_lock(
             &mut self.class_path,
             manifest,
             &resolved,
             &prev_lock,
             &libraries_dir,
-            &repo_urls,
+            &fingerprint,
         )
         .await?;
         lock.local = local_artifacts;
@@ -677,14 +681,13 @@ impl Project {
 async fn resolve_artifacts(
     manifest: &manifest::Manifest,
     prev_lock: &Option<Lock>,
-    repo_entries: &[manifest::RepoEntry],
-    repo_urls: &[String],
-    strategy: manifest::RepoStrategy,
 ) -> Result<ResolvedDependencies> {
+    let repo_entries = manifest.repositories.entries();
+    let strategy = manifest.repositories.strategy;
     let loader = MavenLoader::new(repo_entries, strategy);
 
     if let Some(lock) = prev_lock {
-        loader.seed_from_lock(lock, &manifest.dependencies, repo_urls);
+        loader.seed_from_lock(lock);
     }
 
     let status = status::StatusHandle::get();
@@ -703,7 +706,7 @@ async fn resolve_artifacts(
             coord.clone(),
             dep.artifact_type.clone(),
             dep.classifier.clone(),
-            LoaderBranch::new(dep.exclusions.clone(), i),
+            LoaderBranch::new(dep.exclusions.clone(), i, dep.scope),
         );
     }
 
@@ -721,61 +724,15 @@ async fn resolve_artifacts(
     Ok(resolved)
 }
 
-fn compute_effective_scopes(
-    manifest_deps: &[manifest::Dependency],
-    resolved: &ResolvedDependencies,
-) -> BTreeMap<ArtifactCoordinates, Scope> {
-    use std::collections::HashMap;
-
-    let by_coord: HashMap<_, _> = resolved
-        .artifacts
-        .iter()
-        .map(|a| (&a.coord, a.as_ref()))
-        .collect();
-
-    let mut result = BTreeMap::new();
-    let mut queue = VecDeque::new();
-
-    for dep in manifest_deps {
-        if let Some(coord) = dep.coord() {
-            queue.push_back((coord.clone(), dep.scope));
-        }
-    }
-
-    while let Some((coord, effective_scope)) = queue.pop_front() {
-        match result.entry(coord.clone()) {
-            std::collections::btree_map::Entry::Occupied(mut e) => {
-                if effective_scope <= *e.get() {
-                    continue;
-                }
-                e.insert(effective_scope);
-            }
-            std::collections::btree_map::Entry::Vacant(e) => {
-                e.insert(effective_scope);
-            }
-        }
-
-        if let Some(artifact) = by_coord.get(&coord) {
-            for (child_coord, pom_scope) in &artifact.dependencies {
-                let child_scope = manifest::mediate(effective_scope, *pom_scope);
-                queue.push_back((child_coord.clone(), child_scope));
-            }
-        }
-    }
-
-    result
-}
-
 async fn download_and_lock(
     class_path: &mut BTreeMap<PathBuf, Scope>,
     manifest: &manifest::Manifest,
     resolved: &ResolvedDependencies,
     prev_lock: &Option<Lock>,
     libraries_dir: &Path,
-    repo_urls: &[String],
+    fingerprint: &str,
 ) -> Result<Lock> {
     let manifest_deps = &manifest.dependencies;
-    let effective_scopes = compute_effective_scopes(manifest_deps, resolved);
     let status = status::StatusHandle::get();
 
     let mut lock_artifacts = BTreeSet::new();
@@ -808,15 +765,11 @@ async fn download_and_lock(
             .find(|d| d.coord() == Some(&artifact.coord))
             .map(|d| d.exclusions.clone())
             .unwrap_or_default();
-        let scope = effective_scopes
-            .get(&artifact.coord)
-            .copied()
-            .unwrap_or(Scope::Compile);
+        let scope = artifact.effective_scope;
 
         if let Some(digest) = &expected_digest
             && verify_cached(&out, digest)
         {
-            let (rank, _, _) = resolved.slot_map.get(&artifact.key()).unwrap();
             lock_artifacts.insert(LockArtifact {
                 coord: artifact.coord.clone(),
                 classifier: artifact.classifier.clone(),
@@ -825,8 +778,6 @@ async fn download_and_lock(
                 artifact_path: artifact.artifact_path.clone(),
                 checksum: Checksum::provided(digest.clone()),
                 effective_scope: scope,
-                depth: rank.0,
-                position: rank.1.clone(),
                 dependencies: artifact.dependencies.clone(),
                 exclusions,
             });
@@ -840,7 +791,7 @@ async fn download_and_lock(
     if to_download.is_empty() {
         return Ok(Lock {
             version: "1".to_string(),
-            repositories: repo_urls.iter().cloned().collect(),
+            fingerprint: fingerprint.to_string(),
             artifacts: lock_artifacts,
             local: BTreeSet::new(),
         });
@@ -869,7 +820,6 @@ async fn download_and_lock(
             .iter()
             .find(|(a, _, _, _)| a.key() == key)
             .context("download result does not match any queued artifact")?;
-        let (rank, _, _) = resolved.slot_map.get(&key).unwrap();
         lock_artifacts.insert(LockArtifact {
             coord: artifact.coord.clone(),
             classifier: artifact.classifier.clone(),
@@ -878,8 +828,6 @@ async fn download_and_lock(
             artifact_path: artifact.artifact_path.clone(),
             checksum: Checksum::provided(sha256),
             effective_scope: *scope,
-            depth: rank.0,
-            position: rank.1.clone(),
             dependencies: artifact.dependencies.clone(),
             exclusions: exclusions.clone(),
         });
@@ -890,7 +838,7 @@ async fn download_and_lock(
 
     Ok(Lock {
         version: "1".to_string(),
-        repositories: repo_urls.iter().cloned().collect(),
+        fingerprint: fingerprint.to_string(),
         artifacts: lock_artifacts,
         local: BTreeSet::new(),
     })

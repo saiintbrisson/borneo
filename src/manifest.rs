@@ -148,7 +148,7 @@ impl Repositories {
     }
 }
 
-#[derive(Clone, Copy, Hash, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, Default)]
 pub enum Scope {
     #[default]
     Compile,
@@ -246,6 +246,14 @@ pub fn mediate(parent_scope: Scope, pom_scope: PomScope) -> Scope {
     }
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PomDependency {
+    pub scope: PomScope,
+    pub artifact_type: ArtifactType,
+    pub classifier: Option<String>,
+    pub exclusions: BTreeSet<ExclusionKey>,
+}
+
 pub struct Dependency {
     pub scope: Scope,
     pub artifact_type: ArtifactType,
@@ -319,6 +327,24 @@ impl Manifest {
             .iter()
             .filter_map(|d| d.coord().cloned())
             .collect()
+    }
+
+    pub fn dependency_fingerprint(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for url in self.repositories.urls() {
+            url.hash(&mut hasher);
+        }
+        for dep in &self.dependencies {
+            if let Some(coord) = dep.coord() {
+                coord.hash(&mut hasher);
+            }
+            dep.scope.hash(&mut hasher);
+            dep.artifact_type.hash(&mut hasher);
+            dep.classifier.hash(&mut hasher);
+            dep.exclusions.hash(&mut hasher);
+        }
+        format!("{:016x}", hasher.finish())
     }
 }
 

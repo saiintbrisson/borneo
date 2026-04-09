@@ -8,8 +8,6 @@ pub mod metadata;
 pub mod pom;
 pub mod xml;
 
-use reqwest::header::CONTENT_TYPE;
-
 use crate::{
     manifest::ChecksumPolicy,
     maven::xml::XmlFile,
@@ -31,10 +29,6 @@ pub struct MavenRepositoryClient {
 pub enum ClientError {
     #[error("request failed: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("header {0:?} is missing from response")]
-    MissingHeader(reqwest::header::HeaderName),
-    #[error("invalid content type, expected {0:?}, got {1:?}")]
-    InvalidContentType(String, reqwest::header::HeaderValue),
     #[error("checksum does not exist for url {0:?}")]
     ChecksumNotFound(String),
     #[error("checksum for url {0:?} failed with method {1}")]
@@ -138,7 +132,7 @@ impl MavenRepositoryClient {
             }
         );
 
-        let content = self.execute_request(&path, &[], None).await?;
+        let content = self.execute_request(&path, None).await?;
         let txt = String::from_utf8(content.content.to_vec())
             .map_err(|e| ClientError::ParseError(e.to_string()))?;
 
@@ -148,7 +142,6 @@ impl MavenRepositoryClient {
     async fn execute_request(
         &self,
         path: &str,
-        accepted_mimes: &'static [&[u8]],
         status_key: Option<&str>,
     ) -> Result<Content, ClientError> {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -168,18 +161,16 @@ impl MavenRepositoryClient {
                 _ => Duration::from_secs(20),
             };
 
-            self.try_execute_request(path, accepted_mimes, timeout)
-                .await
-                .map_err(|e| {
-                    if !e.is_retryable() {
-                        return backoff::Error::permanent(e);
-                    }
-                    let status = crate::status::StatusHandle::get();
-                    if let Some(key) = status_key {
-                        status.update(key, format!("retrying {key} ({e})"));
-                    }
-                    backoff::Error::transient(e)
-                })
+            self.try_execute_request(path, timeout).await.map_err(|e| {
+                if !e.is_retryable() {
+                    return backoff::Error::permanent(e);
+                }
+                let status = crate::status::StatusHandle::get();
+                if let Some(key) = status_key {
+                    status.update(key, format!("retrying {key} ({e})"));
+                }
+                backoff::Error::transient(e)
+            })
         })
         .await
     }
@@ -187,7 +178,6 @@ impl MavenRepositoryClient {
     async fn try_execute_request(
         &self,
         path: &str,
-        accepted_mimes: &'static [&[u8]],
         timeout: Duration,
     ) -> Result<Content, ClientError> {
         let url = format!("{}/{path}", self.base);
@@ -200,18 +190,6 @@ impl MavenRepositoryClient {
 
         let (resp, digest) = join(req, self.fetch_digest(&url)).await;
         let resp = resp?.error_for_status()?;
-
-        let ty = resp
-            .headers()
-            .get(CONTENT_TYPE)
-            .ok_or_else(|| ClientError::MissingHeader(CONTENT_TYPE))?;
-
-        if !accepted_mimes.is_empty() && !accepted_mimes.contains(&ty.as_bytes()) {
-            return Err(ClientError::InvalidContentType(
-                path.to_string(),
-                ty.clone(),
-            ));
-        }
 
         let content = resp.bytes().await?;
 
@@ -246,7 +224,7 @@ impl MavenRepositoryClient {
         path: &str,
         status_key: Option<&str>,
     ) -> Result<XmlFile, ClientError> {
-        let content = self.execute_request(path, &[], status_key).await?;
+        let content = self.execute_request(path, status_key).await?;
         let txt = String::from_utf8(content.content.to_vec())
             .map_err(|e| ClientError::ParseError(e.to_string()))?;
 
@@ -259,7 +237,7 @@ impl MavenRepositoryClient {
         out: &Utf8Path,
         status_key: Option<&str>,
     ) -> Result<Asset, ClientError> {
-        let content = self.execute_request(path, &[], status_key).await?;
+        let content = self.execute_request(path, status_key).await?;
         let sha256 = <sha2::Sha256 as sha2::Digest>::digest(&content.content).to_vec();
         tokio::fs::write(out, &content.content).await?;
 
