@@ -64,7 +64,7 @@ version "1.0.0"
 dependencies {
     compile "com.google.guava:guava:33.3.1-jre" {
         exclude "com.google.code.findbugs:jsr305"
-        exclude "com.google.errorprone:error_prone_annotations"
+        exclude "com.google.errorprone:*"
     }
 
     compile "com.google.code.gson:gson:2.11.0"
@@ -154,6 +154,7 @@ build {
     // or, optionally exclude certain dependencies
     shadow {
         exclude "com.google.guava:guava-parent"
+        exclude "com.google.*:*"
     }
 
     // a shell command to be executed after the build step. BORNEO_BUILD_OUTPUT is an absolute path to the output JAR

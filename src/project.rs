@@ -16,6 +16,7 @@ use crate::{
     },
     maven::loader::{LoaderBranch, MavenLoader, ResolvedDependencies, verify_cached},
     status,
+    types::ArtifactCoordinates,
 };
 
 const NATIVE_EXTENSIONS: &[&str] = &["dll", "so", "dylib"];
@@ -39,6 +40,25 @@ pub trait Compiler {
     ) -> Result<std::process::Output>;
 }
 
+#[derive(Clone, Debug)]
+pub struct ClassPathEntry {
+    pub scope: Scope,
+    pub coord: Option<ArtifactCoordinates>,
+}
+
+impl ClassPathEntry {
+    pub fn local(scope: Scope) -> Self {
+        Self { scope, coord: None }
+    }
+
+    pub fn maven(scope: Scope, coord: ArtifactCoordinates) -> Self {
+        Self {
+            scope,
+            coord: Some(coord),
+        }
+    }
+}
+
 pub struct Project {
     pub dir: PathBuf,
     pub build_dir: PathBuf,
@@ -47,7 +67,7 @@ pub struct Project {
     java: Option<crate::java::Java>,
     resources: Option<PathBuf>,
     packaging: Packaging,
-    pub class_path: BTreeMap<PathBuf, Scope>,
+    pub class_path: BTreeMap<PathBuf, ClassPathEntry>,
     pub manifest: Option<manifest::Manifest>,
 }
 
@@ -122,7 +142,7 @@ impl Project {
             java: None,
             resources,
             packaging,
-            class_path: BTreeMap::from([(dir, Scope::Compile)]),
+            class_path: BTreeMap::from([(dir, ClassPathEntry::local(Scope::Compile))]),
             manifest,
         })
     }
@@ -134,7 +154,7 @@ impl Project {
     pub fn processor_path_iter(&self) -> impl Iterator<Item = &PathBuf> {
         self.class_path
             .iter()
-            .filter(|(_, scope)| matches!(scope, Scope::Processor))
+            .filter(|(_, entry)| matches!(entry.scope, Scope::Processor))
             .map(|(path, _)| path)
     }
 
@@ -201,8 +221,10 @@ impl Project {
         std::fs::create_dir_all(&classes_dir).context("failed to create classes directory")?;
 
         for compiler in &compilers {
-            self.class_path
-                .insert(compiler.source().to_path_buf(), Scope::Compile);
+            self.class_path.insert(
+                compiler.source().to_path_buf(),
+                ClassPathEntry::local(Scope::Compile),
+            );
         }
 
         let status = status::StatusHandle::get();
@@ -303,7 +325,8 @@ impl Project {
         match self.packaging {
             Packaging::Dir => {
                 if let Some(resources) = &self.resources {
-                    self.class_path.insert(resources.clone(), Scope::Compile);
+                    self.class_path
+                        .insert(resources.clone(), ClassPathEntry::local(Scope::Compile));
                 }
                 Ok(None)
             }
@@ -388,12 +411,16 @@ impl Project {
                         format!("bundled {}", rel_final.display()),
                         || {
                             let mut writer = JarWriter::new(&final_jar);
-                            writer.copy_jar_contents(&slim_jar, &Default::default());
-                            for (path, scope) in &self.class_path {
-                                if matches!(scope, Scope::Compile | Scope::Runtime)
+                            writer.copy_jar_contents(&slim_jar, None, &Default::default());
+                            for (path, entry) in &self.class_path {
+                                if matches!(entry.scope, Scope::Compile | Scope::Runtime)
                                     && path.extension().is_some_and(|ext| ext == "jar")
                                 {
-                                    writer.copy_jar_contents(path, &shadow_config.exclusions);
+                                    writer.copy_jar_contents(
+                                        path,
+                                        entry.coord.as_ref(),
+                                        &shadow_config.exclusions,
+                                    );
                                 }
                             }
                             writer.flush();
@@ -510,8 +537,8 @@ impl Project {
         let standalone_jar = self
             .class_path
             .iter()
-            .find(|(path, scope)| {
-                matches!(scope, Scope::Test)
+            .find(|(path, entry)| {
+                matches!(entry.scope, Scope::Test)
                     && path
                         .file_name()
                         .and_then(|f| f.to_str())
@@ -648,7 +675,8 @@ impl Project {
                     path: path.display().to_string(),
                     checksum: Checksum::provided(hash.to_vec()),
                 });
-                self.class_path.insert(abs, dep.scope);
+                self.class_path
+                    .insert(abs, ClassPathEntry::local(dep.scope));
             }
         }
 
@@ -725,7 +753,7 @@ async fn resolve_artifacts(
 }
 
 async fn download_and_lock(
-    class_path: &mut BTreeMap<PathBuf, Scope>,
+    class_path: &mut BTreeMap<PathBuf, ClassPathEntry>,
     manifest: &manifest::Manifest,
     resolved: &ResolvedDependencies,
     prev_lock: &Option<Lock>,
@@ -781,7 +809,7 @@ async fn download_and_lock(
                 dependencies: artifact.dependencies.clone(),
                 exclusions,
             });
-            class_path.insert(out, scope);
+            class_path.insert(out, ClassPathEntry::maven(scope, artifact.coord.clone()));
             continue;
         }
 
@@ -831,7 +859,10 @@ async fn download_and_lock(
             dependencies: artifact.dependencies.clone(),
             exclusions: exclusions.clone(),
         });
-        class_path.insert(out.clone(), *scope);
+        class_path.insert(
+            out.clone(),
+            ClassPathEntry::maven(*scope, artifact.coord.clone()),
+        );
     }
 
     status.log(format!("downloaded {} artifacts", to_download.len()));

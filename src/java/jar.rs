@@ -7,7 +7,7 @@ use std::{
 
 use zip::{ZipArchive, ZipWriter, write::FileOptions};
 
-use crate::types::ExclusionKey;
+use crate::types::{ArtifactCoordinates, ExclusionPattern};
 
 pub struct JarWriter {
     writer: ZipWriter<File>,
@@ -24,8 +24,13 @@ impl JarWriter {
         }
     }
 
-    pub fn copy_jar_contents(&mut self, jar: &Path, excluded: &BTreeSet<ExclusionKey>) {
-        if is_excluded(jar, excluded) {
+    pub fn copy_jar_contents(
+        &mut self,
+        jar: &Path,
+        coord: Option<&ArtifactCoordinates>,
+        excluded: &BTreeSet<ExclusionPattern>,
+    ) {
+        if is_excluded(coord, excluded) {
             return;
         }
         let file = File::open(jar).unwrap();
@@ -61,14 +66,11 @@ impl JarWriter {
     }
 }
 
-fn is_excluded(jar: &Path, excluded: &BTreeSet<ExclusionKey>) -> bool {
-    let Some(stem) = jar.file_stem().and_then(|s| s.to_str()) else {
+fn is_excluded(coord: Option<&ArtifactCoordinates>, excluded: &BTreeSet<ExclusionPattern>) -> bool {
+    let Some(coord) = coord else {
         return false;
     };
-    excluded.iter().any(|key| {
-        let prefix = key.to_string().replace(':', "-");
-        stem.starts_with(&format!("{prefix}-"))
-    })
+    excluded.iter().any(|pattern| pattern.matches(coord))
 }
 
 fn clean(path: &Path) -> PathBuf {

@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-use crate::types::{ArtifactId, ArtifactVersion, ExclusionKey, GroupId};
+use crate::types::{ArtifactId, ArtifactVersion, ExclusionPattern, GroupId};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,8 +60,8 @@ pub struct Exclusion {
 }
 
 impl Exclusion {
-    pub fn to_key(&self) -> ExclusionKey {
-        ExclusionKey::new(self.group_id.clone(), self.artifact_id.clone())
+    pub fn to_pattern(&self) -> anyhow::Result<ExclusionPattern> {
+        format!("{}:{}", self.group_id.as_str(), self.artifact_id.as_str()).parse()
     }
 }
 

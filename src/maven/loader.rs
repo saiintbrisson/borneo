@@ -19,7 +19,7 @@ use crate::{
         xml::{XmlFile, XmlNode},
     },
     status::StatusHandle,
-    types::{ArtifactCoordinates, ArtifactKey, ArtifactType, ArtifactVersion, ExclusionKey},
+    types::{ArtifactCoordinates, ArtifactKey, ArtifactType, ArtifactVersion, ExclusionPattern},
 };
 
 type Cache<K, V> = DashMap<K, CacheEntry<V>>;
@@ -63,12 +63,12 @@ impl ResolvedArtifact {
 pub struct LoaderBranch {
     pub depth: usize,
     effective_scope: Scope,
-    exclusions: BTreeSet<ExclusionKey>,
+    exclusions: BTreeSet<ExclusionPattern>,
     position: Vec<usize>,
 }
 
 impl LoaderBranch {
-    pub fn new(exclusions: BTreeSet<ExclusionKey>, position: usize, scope: Scope) -> Self {
+    pub fn new(exclusions: BTreeSet<ExclusionPattern>, position: usize, scope: Scope) -> Self {
         Self {
             depth: 0,
             effective_scope: scope,
@@ -80,7 +80,7 @@ impl LoaderBranch {
     fn child(
         &self,
         index: usize,
-        extra_exclusions: impl IntoIterator<Item = ExclusionKey>,
+        extra_exclusions: impl IntoIterator<Item = ExclusionPattern>,
         pom_scope: PomScope,
     ) -> Self {
         let mut exclusions = self.exclusions.clone();
@@ -95,8 +95,8 @@ impl LoaderBranch {
         }
     }
 
-    fn is_excluded(&self, key: &ExclusionKey) -> bool {
-        self.exclusions.contains(key)
+    fn is_excluded(&self, coord: &ArtifactCoordinates) -> bool {
+        self.exclusions.iter().any(|p| p.matches(coord))
     }
 }
 
@@ -307,7 +307,11 @@ impl MavenLoader {
                 })?,
             );
 
-            let exclusions = dep.exclusions.iter().map(|e| e.to_key()).collect();
+            let exclusions = dep
+                .exclusions
+                .iter()
+                .map(|e| e.to_pattern())
+                .collect::<anyhow::Result<_>>()?;
 
             deps.insert(
                 coord,
@@ -346,11 +350,7 @@ impl MavenLoader {
             .await?;
 
         for (i, (dep_coord, pom_dep)) in entry.1.iter().enumerate() {
-            let excl_key = ExclusionKey::new(
-                dep_coord.group_id().clone(),
-                dep_coord.artifact_id().clone(),
-            );
-            if branch.is_excluded(&excl_key) {
+            if branch.is_excluded(dep_coord) {
                 continue;
             }
 

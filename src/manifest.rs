@@ -7,7 +7,7 @@ use kdl::{KdlDocument, KdlNode, KdlValue};
 use miette::{LabeledSpan, NamedSource};
 
 use crate::types::{
-    ArtifactCoordinates, ArtifactId, ArtifactType, ArtifactVersion, ExclusionKey, GroupId,
+    ArtifactCoordinates, ArtifactId, ArtifactType, ArtifactVersion, ExclusionPattern, GroupId,
 };
 
 pub mod lock;
@@ -88,7 +88,7 @@ impl Default for TestConfig {
 }
 
 pub struct ShadowConfig {
-    pub exclusions: BTreeSet<ExclusionKey>,
+    pub exclusions: BTreeSet<ExclusionPattern>,
 }
 
 #[derive(Default)]
@@ -251,7 +251,7 @@ pub struct PomDependency {
     pub scope: PomScope,
     pub artifact_type: ArtifactType,
     pub classifier: Option<String>,
-    pub exclusions: BTreeSet<ExclusionKey>,
+    pub exclusions: BTreeSet<ExclusionPattern>,
 }
 
 pub struct Dependency {
@@ -259,7 +259,7 @@ pub struct Dependency {
     pub artifact_type: ArtifactType,
     pub classifier: Option<String>,
     pub source: DependencySource,
-    pub exclusions: BTreeSet<ExclusionKey>,
+    pub exclusions: BTreeSet<ExclusionPattern>,
 }
 
 pub enum DependencySource {
@@ -666,7 +666,7 @@ fn parse_shadow_config(node: &KdlNode, src: &NamedSource<String>) -> miette::Res
 
             match entry.value() {
                 KdlValue::String(s) => {
-                    let key: ExclusionKey = s.parse().map_err(|e: anyhow::Error| {
+                    let key: ExclusionPattern = s.parse().map_err(|e: anyhow::Error| {
                         miette::miette!(
                             labels = vec![LabeledSpan::at(entry.span(), "invalid artifact key")],
                             "{e}"
@@ -790,7 +790,7 @@ fn parse_dependency(node: &KdlNode, src: &NamedSource<String>) -> miette::Result
 
             match entry.value() {
                 KdlValue::String(s) => {
-                    let key: ExclusionKey = s.parse().map_err(|e: anyhow::Error| {
+                    let key: ExclusionPattern = s.parse().map_err(|e: anyhow::Error| {
                         miette::miette!(
                             labels = vec![LabeledSpan::at(entry.span(), "invalid artifact key")],
                             "{e}"

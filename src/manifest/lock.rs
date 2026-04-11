@@ -5,7 +5,7 @@ use camino::Utf8PathBuf;
 use kdl::{KdlDocument, KdlEntry, KdlNode, KdlValue};
 
 use crate::manifest::{PomDependency, PomScope, Scope};
-use crate::types::{ArtifactCoordinates, ArtifactType, ExclusionKey};
+use crate::types::{ArtifactCoordinates, ArtifactType, ExclusionPattern};
 
 pub struct Lock {
     pub version: String,
@@ -30,7 +30,7 @@ pub struct LockArtifact {
     pub checksum: Checksum,
     pub effective_scope: Scope,
     pub dependencies: BTreeMap<ArtifactCoordinates, PomDependency>,
-    pub exclusions: BTreeSet<ExclusionKey>,
+    pub exclusions: BTreeSet<ExclusionPattern>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]

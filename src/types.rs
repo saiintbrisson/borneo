@@ -1,6 +1,7 @@
 use std::str::FromStr;
 
-use anyhow::ensure;
+use anyhow::{Context, ensure};
+use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,42 +80,82 @@ impl std::fmt::Display for ArtifactVersion {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExclusionKey(GroupId, ArtifactId);
+/// A pattern that matches a Maven coordinate by groupId and artifactId.
+#[derive(Clone)]
+pub struct ExclusionPattern {
+    raw: String,
+    group: GlobMatcher,
+    artifact: GlobMatcher,
+}
 
-impl ExclusionKey {
-    pub fn new(group_id: GroupId, artifact_id: ArtifactId) -> Self {
-        Self(group_id, artifact_id)
+impl ExclusionPattern {
+    pub fn matches(&self, coord: &ArtifactCoordinates) -> bool {
+        self.group.is_match(coord.group_id().as_str())
+            && self.artifact.is_match(coord.artifact_id().as_str())
     }
 }
 
-impl FromStr for ExclusionKey {
+impl FromStr for ExclusionPattern {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let (gid, aid) = s
             .split_once(':')
-            .ok_or_else(|| anyhow::anyhow!("missing ':' in exclusion key"))?;
-        Ok(Self(
-            GroupId(gid.replace('/', ".")),
-            ArtifactId(aid.to_string()),
-        ))
+            .ok_or_else(|| anyhow::anyhow!("missing ':' in exclusion pattern: {s}"))?;
+        let gid = gid.replace('/', ".");
+        let group = Glob::new(&gid)
+            .with_context(|| format!("invalid group glob in exclusion: {gid}"))?
+            .compile_matcher();
+        let artifact = Glob::new(aid)
+            .with_context(|| format!("invalid artifact glob in exclusion: {aid}"))?
+            .compile_matcher();
+        Ok(Self {
+            raw: format!("{gid}:{aid}"),
+            group,
+            artifact,
+        })
     }
 }
 
-impl std::fmt::Display for ExclusionKey {
+impl std::fmt::Display for ExclusionPattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.0.0, self.1.0)
+        f.write_str(&self.raw)
     }
 }
 
-impl std::fmt::Debug for ExclusionKey {
+impl std::fmt::Debug for ExclusionPattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ExclusionKey({}:{})", self.0.0, self.1.0)
+        write!(f, "ExclusionPattern({})", self.raw)
     }
 }
 
-impl<'de> serde::Deserialize<'de> for ExclusionKey {
+impl PartialEq for ExclusionPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for ExclusionPattern {}
+
+impl PartialOrd for ExclusionPattern {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ExclusionPattern {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.raw.cmp(&other.raw)
+    }
+}
+
+impl std::hash::Hash for ExclusionPattern {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ExclusionPattern {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -125,7 +166,7 @@ impl<'de> serde::Deserialize<'de> for ExclusionKey {
     }
 }
 
-impl serde::Serialize for ExclusionKey {
+impl serde::Serialize for ExclusionPattern {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
